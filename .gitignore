@@ -22,6 +22,7 @@ pulse_phases.csv
 *.pdf
 *.svg
 new_code/intake_phase_vs_boss*.png
+new_code/intake_phase_report/
 
 # Local exploratory notebooks can contain outputs or machine-specific paths.
 tutorial_read_stim_epochs_sub103.ipynb

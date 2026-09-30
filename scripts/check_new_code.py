@@ -44,6 +44,7 @@ def compile_sources() -> None:
 def import_new_code() -> None:
     import functions  # noqa: F401
     import run_intake_phase_viewer  # noqa: F401
+    import run_intake_phase_html_report  # noqa: F401
     import inspect_intake_metadata  # noqa: F401
 
 
