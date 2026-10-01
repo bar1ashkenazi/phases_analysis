@@ -1,30 +1,35 @@
-# Intake Phase Viewer
+# Intake Phase Analysis
 
-Reusable code lives in `functions.py`.
-Analysis parameters and paths live in the runner scripts, not in `functions.py`.
+All analysis logic lives in `functions.py` (single source of truth). Parameters and
+paths live in `settings.py`. Everything else only calls `functions.py` and renders
+the results.
 
-Manual runners:
+Terminology: one epoch = one trial (one stimulus event around t=0). An Optuna
+"trial" (`OPT_N_TRIALS`) is one candidate causal parameter set, not an EEG epoch.
 
-- `run_intake_phase_viewer.py` loads one subject or a list of subjects, estimates the
-  non-causal phase at `t=0`, optionally estimates causal AR phase, and shows a
-  circular clickable plot colored by BOSS classification.
-- `inspect_intake_metadata.py` prints intake metadata columns and values, useful for
-  confirming which column contains the BOSS positive/negative labels.
-- `run_intake_phase_html_report.py` runs the calculation once, caches the results
-  as JSON, and writes a self-contained interactive HTML report. Re-run it with
-  `--from-cache` to rebuild only the HTML after visualization edits.
+Files:
+
+- `functions.py`: loading (`get_data`), phase estimation (`noncausal_phase`,
+  `causal_phase`, `estimate_all_subjects`), causal parameter optimization,
+  classification/scoring (`classify_phase`, `score_vs_boss`), deviations and
+  circular statistics (`analyze_phase_results`), and static figures.
+- `settings.py`: subjects, data path, preprocessing, band, tolerances, causal
+  parameters and optimization ranges.
+- `run_intake_phase_html_report.py`: computes estimates once, caches them as JSON,
+  and writes a self-contained interactive HTML report plus a publication figure.
+- `phase_pipeline_walkthrough.ipynb`: step-by-step notebook (load one epoch as a
+  NumPy array, each processing step with plots and parameter explanations, final
+  results). Update `DATA_ROOT` in its settings cell to your data location.
+- `inspect_intake_metadata.py`: prints intake metadata columns and values, useful
+  for confirming which column contains the BOSS positive/negative labels.
+
+Ground-truth filter order: with `CAUSAL_PARAMS_MODE = "optimize"` each subject's
+optimized causal `filter_order` is also used for the non-causal estimate; with
+`"manual"` (or `CAUSAL_ESTIMATION = False`) `FILTER_ORDER` is used.
+
+## Interactive HTML report
 
 Run from the project root:
-
-```bash
-./.venv/bin/python new_code/run_intake_phase_viewer.py
-```
-
-Set `CAUSAL_ESTIMATION = False` for the old non-causal-only plot. Set
-`CAUSAL_PARAMS_MODE = "manual"` to use the runner's AR parameters, or `"optimize"`
-to fit one causal AR parameter set per subject and print the selected values.
-
-Interactive HTML report:
 
 ```bash
 ./.venv/bin/python new_code/run_intake_phase_html_report.py
@@ -33,10 +38,33 @@ Interactive HTML report:
 Outputs are written to `new_code/intake_phase_report/`:
 
 - `intake_phase_results.json`: cached estimates and selected causal params.
-- `intake_phase_report.html`: the interactive report.
+- `intake_phase_report.html`: phase circle, trial signals, deviation histograms
+  (phase − BOSS target, causal − non-causal; per subject or pooled) and BOSS
+  success vs tolerance.
+- `success_vs_tolerance.pdf` / `.png`: publication version of the success figure
+  (one dot per subject, mean ± SD, chance = 2T/360).
 
-To avoid rerunning optimization while iterating on the HTML, use:
+To rebuild the HTML and figures without touching the EEG data (all derived numbers
+are recomputed from the cached phases):
 
 ```bash
 ./.venv/bin/python new_code/run_intake_phase_html_report.py --from-cache
+```
+
+Synthetic demo (no data needed): add `--demo --output-dir /tmp/intake_phase_report_demo`.
+
+## Notebook
+
+```bash
+./.venv/bin/jupyter lab new_code/phase_pipeline_walkthrough.ipynb
+```
+
+Set `DEMO = True` in the settings cell to run on synthetic epochs.
+
+## Checks
+
+```bash
+./.venv/bin/python scripts/check_new_code.py              # compile, imports, synthetic tests, demo report
+./.venv/bin/python scripts/check_new_code.py --notebook   # also execute the notebook in DEMO mode
+./.venv/bin/python scripts/check_new_code.py --with-data --subject sub_103 --n-trials 2   # NAS mounted
 ```
