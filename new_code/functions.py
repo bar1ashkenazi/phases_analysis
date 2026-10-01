@@ -1,5 +1,11 @@
 """Reusable helpers for intake-session phase/BOSS comparison.
 
+This module is the single source of analysis logic. Runners, the HTML report and the
+walkthrough notebook only call these functions and render what they return.
+
+Terminology: one epoch = one trial = one stimulus event cut out around t=0. An Optuna
+"trial" (``n_opt_trials``) is something else: one evaluated causal parameter set.
+
 The non-causal phase estimate intentionally follows the working logic in
 ``pipeline.py``: zero-phase FIR filtering across the full epoch, Hilbert transform,
 then phase/amplitude read out at the sample nearest t=0.
@@ -19,41 +25,104 @@ from scipy.signal import filtfilt, hilbert
 from phastimate import design_bandpass, phastimate
 
 
-@dataclass
-class SubjectData:
-    subject: str
-    epochs: mne.Epochs
-    fs: float
-    data: np.ndarray
-    times_ms: np.ndarray
-    conditions: np.ndarray
+# ---- Labels and colors ---------------------------------------------------
+
+@dataclass(frozen=True)
+class LabelScheme:
+    """BOSS label vocabulary: output class names and the raw metadata values mapped to them."""
+
+    positive: str = "positive"
+    negative: str = "negative"
+    unknown: str = "unknown"
+    unclassified: str = "unclassified"
+    positive_labels: frozenset[str] = frozenset({"positive", "pos", "p", "1", "true", "peak"})
+    negative_labels: frozenset[str] = frozenset({"negative", "neg", "n", "0", "false", "trough"})
+
+    @property
+    def class_order(self) -> tuple[str, str, str]:
+        return (self.positive, self.negative, self.unknown)
+
+    def target_deg(self, label: str) -> float | None:
+        """Intended BOSS phase: 0 deg (positive peak) or 180 deg (negative trough)."""
+        if label == self.positive:
+            return 0.0
+        if label == self.negative:
+            return 180.0
+        return None
+
+
+DEFAULT_LABELS = LabelScheme()
+
+# Paul Tol "vibrant" (colorblind-safe). Pink/blue mean BOSS class only; method traces
+# use neutral charcoal (non-causal) and orange (causal) so they never read as a class.
+CLASS_COLORS = {
+    DEFAULT_LABELS.positive: "#EE3377",
+    DEFAULT_LABELS.negative: "#0077BB",
+    DEFAULT_LABELS.unknown: "#858b93",
+}
+METHOD_COLORS = {"raw": "#9a9e98", "noncausal": "#33363b", "causal": "#EE7733"}
+
+METHODS = ("noncausal", "causal")
+DEVIATION_KINDS = ("causal_error", "boss_target")
+
+
+# ---- Loading -------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LoadConfig:
+    """Where intake epochs live and how they are preprocessed before phase estimation.
+
+    Parameters
+    ----------
+    data_root : Path
+        Folder containing ``<subject>/EEG/processed/<intake_filename>``.
+    intake_filename : str
+        Epoch file name pattern, formatted with ``subject``.
+    channel : str
+        Channel to analyze. If equal to ``hjorth_channel`` it is built from ``hjorth_weights``.
+    condition_column : str
+        Metadata column with the BOSS label. If missing, columns matching
+        ``condition_auto_keywords`` are tried.
+    lowpass_before_downsample_hz : float or None
+        Anti-alias low-pass applied before resampling (Hz).
+    downsample, downsample_fs : bool, float
+        Resample epochs to ``downsample_fs`` Hz.
+    hjorth_channel, hjorth_weights, hjorth_scale_reference
+        Weighted Hjorth/Laplacian channel definition; it is rescaled to the std of
+        ``hjorth_scale_reference``.
+    """
+
+    data_root: Path
+    intake_filename: str
+    channel: str
     condition_column: str
-    channel: str
+    condition_auto_keywords: tuple[str, ...]
+    lowpass_before_downsample_hz: float | None
+    downsample: bool
+    downsample_fs: float
+    hjorth_channel: str
+    hjorth_weights: dict[str, float]
+    hjorth_scale_reference: str
+    labels: LabelScheme = DEFAULT_LABELS
+    show_metadata_summary: bool = False
+    metadata_max_values: int = 12
 
 
 @dataclass
-class TrialEstimate:
+class EpochArrays:
+    """One subject's epochs as plain arrays.
+
+    ``X`` has shape (n_epochs, n_times) in volts, ``times_ms`` is relative to the
+    stimulus (t=0), ``labels`` holds one BOSS class name per epoch.
+    """
+
     subject: str
-    epoch_index: int
-    condition: str
-    noncausal_class: str
-    phase_rad: float
-    phase_deg: float
-    amplitude: float
-    raw: np.ndarray
-    filtered: np.ndarray
+    X: np.ndarray
     times_ms: np.ndarray
+    fs: float
+    labels: np.ndarray
     channel: str
-    causal_class: str | None = None
-    causal_phase_rad: float | None = None
-    causal_phase_deg: float | None = None
-    causal_amplitude: float | None = None
-    causal_core: np.ndarray | None = None
-    causal_pred_future: np.ndarray | None = None
-    causal_core_times_ms: np.ndarray | None = None
-    causal_future_times_ms: np.ndarray | None = None
-    causal_phase_error_deg: float | None = None
-    causal_params: dict[str, float | int] | None = None
+    condition_column: str
 
 
 def as_subject_list(subjects: str | Sequence[str]) -> list[str]:
@@ -64,6 +133,16 @@ def as_subject_list(subjects: str | Sequence[str]) -> list[str]:
 
 def intake_epoch_path(subject: str, data_root: Path, intake_filename: str) -> Path:
     return data_root / subject / "EEG" / "processed" / intake_filename.format(subject=subject)
+
+
+def available_intake_subjects(data_root: Path, intake_filename: str) -> list[str]:
+    if not data_root.exists():
+        return []
+    subjects = []
+    for path in sorted(data_root.glob("sub_*")):
+        if intake_epoch_path(path.name, data_root, intake_filename).exists():
+            subjects.append(path.name)
+    return subjects
 
 
 def add_weighted_hjorth_channel(
@@ -94,47 +173,34 @@ def add_weighted_hjorth_channel(
     return epochs
 
 
-def normalize_boss_label(
-    value,
-    positive_labels: set[str],
-    negative_labels: set[str],
-    positive_name: str,
-    negative_name: str,
-    unknown_name: str,
-) -> str:
-    """Map raw metadata values to positive/negative/unknown."""
+def normalize_boss_label(value, labels: LabelScheme = DEFAULT_LABELS) -> str:
+    """Map a raw metadata value to positive/negative/unknown."""
     if value is None:
-        return unknown_name
+        return labels.unknown
 
     if isinstance(value, (bool, np.bool_)):
-        return positive_name if value else negative_name
+        return labels.positive if value else labels.negative
 
     if isinstance(value, (int, float, np.integer, np.floating)):
         if np.isnan(value):
-            return unknown_name
+            return labels.unknown
         if np.isclose(value, 1):
-            return positive_name
+            return labels.positive
         if np.isclose(value, 0):
-            return negative_name
+            return labels.negative
 
     normalized = str(value).strip().lower()
     if normalized.endswith(".0"):
         normalized = normalized[:-2]
-    if normalized in positive_labels:
-        return positive_name
-    if normalized in negative_labels:
-        return negative_name
-    return unknown_name
+    if normalized in labels.positive_labels:
+        return labels.positive
+    if normalized in labels.negative_labels:
+        return labels.negative
+    return labels.unknown
 
 
-def available_intake_subjects(data_root: Path, intake_filename: str) -> list[str]:
-    if not data_root.exists():
-        return []
-    subjects = []
-    for path in sorted(data_root.glob("sub_*")):
-        if intake_epoch_path(path.name, data_root, intake_filename).exists():
-            subjects.append(path.name)
-    return subjects
+def _map_labels(column, labels: LabelScheme):
+    return column.map(lambda value: normalize_boss_label(value, labels))
 
 
 def summarize_metadata(epochs: mne.Epochs, max_values: int) -> None:
@@ -150,170 +216,142 @@ def summarize_metadata(epochs: mne.Epochs, max_values: int) -> None:
         print(f"  - {column}: {values_str}")
 
 
-def _resolve_condition_column(
-    epochs: mne.Epochs,
-    requested: str,
-    positive_labels: set[str],
-    negative_labels: set[str],
-    positive_name: str,
-    negative_name: str,
-    unknown_name: str,
-    auto_keywords: Sequence[str],
-) -> str:
+def _resolve_condition_column(epochs: mne.Epochs, config: LoadConfig) -> str:
     if epochs.metadata is None:
         raise ValueError("The epochs file has no metadata, so BOSS labels cannot be read.")
-    if requested in epochs.metadata.columns:
-        return requested
+    if config.condition_column in epochs.metadata.columns:
+        return config.condition_column
 
+    labels = config.labels
     candidates = [
         column for column in epochs.metadata.columns
-        if any(key in column.lower() for key in auto_keywords)
+        if any(key in column.lower() for key in config.condition_auto_keywords)
     ]
     for column in candidates:
-        mapped = epochs.metadata[column].map(
-            lambda value: normalize_boss_label(
-                value,
-                positive_labels=positive_labels,
-                negative_labels=negative_labels,
-                positive_name=positive_name,
-                negative_name=negative_name,
-                unknown_name=unknown_name,
-            )
-        )
-        if mapped.isin([positive_name, negative_name]).any():
+        if _map_labels(epochs.metadata[column], labels).isin([labels.positive, labels.negative]).any():
             print(f"Using metadata column {column!r} for BOSS labels.")
             return column
 
     raise ValueError(
-        f"Could not find BOSS label column {requested!r}. "
+        f"Could not find BOSS label column {config.condition_column!r}. "
         f"Available columns: {list(epochs.metadata.columns)}"
     )
 
 
-def load_intake_subject(
-    subject: str,
-    data_root: Path,
-    intake_filename: str,
-    channel: str,
-    condition_column: str,
-    lowpass_before_downsample_hz: float | None,
-    downsample: bool,
-    downsample_fs: float,
-    show_metadata_summary: bool,
-    metadata_max_values: int,
-    hjorth_channel: str,
-    hjorth_weights: dict[str, float],
-    hjorth_scale_reference: str,
-    positive_labels: set[str],
-    negative_labels: set[str],
-    positive_name: str,
-    negative_name: str,
-    unknown_name: str,
-    condition_auto_keywords: Sequence[str],
-) -> SubjectData:
-    epo_path = intake_epoch_path(subject, data_root, intake_filename)
+def get_data(subject: str, config: LoadConfig) -> EpochArrays:
+    """Load one subject's intake epochs into arrays.
+
+    Steps: read ``.fif`` -> optional low-pass -> optional resample -> optional Hjorth
+    channel -> pick ``config.channel`` -> map BOSS metadata to class names.
+
+    Returns
+    -------
+    EpochArrays
+        ``X`` (n_epochs, n_times) in volts, ``times_ms``, ``fs`` (Hz), ``labels``.
+    """
+    epo_path = intake_epoch_path(subject, config.data_root, config.intake_filename)
     if not epo_path.exists():
         raise FileNotFoundError(f"Intake epochs not found for {subject}: {epo_path}")
 
     epochs = mne.read_epochs(epo_path, preload=True)
-    if lowpass_before_downsample_hz is not None:
-        epochs.filter(l_freq=None, h_freq=lowpass_before_downsample_hz, picks="eeg", verbose=False)
-    if downsample:
-        epochs.resample(downsample_fs)
-    if channel == hjorth_channel:
+    if config.lowpass_before_downsample_hz is not None:
+        epochs.filter(l_freq=None, h_freq=config.lowpass_before_downsample_hz, picks="eeg", verbose=False)
+    if config.downsample:
+        epochs.resample(config.downsample_fs)
+    if config.channel == config.hjorth_channel:
         epochs = add_weighted_hjorth_channel(
             epochs,
-            output_channel=hjorth_channel,
-            weights_by_channel=hjorth_weights,
-            scale_reference_channel=hjorth_scale_reference,
+            output_channel=config.hjorth_channel,
+            weights_by_channel=config.hjorth_weights,
+            scale_reference_channel=config.hjorth_scale_reference,
         )
 
-    if show_metadata_summary:
+    if config.show_metadata_summary:
         print(f"\n[{subject}] {epo_path}")
-        summarize_metadata(epochs, metadata_max_values)
+        summarize_metadata(epochs, config.metadata_max_values)
 
-    resolved_condition_column = _resolve_condition_column(
-        epochs,
-        requested=condition_column,
-        positive_labels=positive_labels,
-        negative_labels=negative_labels,
-        positive_name=positive_name,
-        negative_name=negative_name,
-        unknown_name=unknown_name,
-        auto_keywords=condition_auto_keywords,
-    )
-    conditions = epochs.metadata[resolved_condition_column].map(
-        lambda value: normalize_boss_label(
-            value,
-            positive_labels=positive_labels,
-            negative_labels=negative_labels,
-            positive_name=positive_name,
-            negative_name=negative_name,
-            unknown_name=unknown_name,
-        )
-    ).to_numpy()
-
-    fs = float(epochs.info["sfreq"])
-    data = epochs.get_data(picks=channel)[:, 0, :]
-    times_ms = epochs.times * 1000.0
-
-    return SubjectData(
+    condition_column = _resolve_condition_column(epochs, config)
+    return EpochArrays(
         subject=subject,
-        epochs=epochs,
-        fs=fs,
-        data=data,
-        times_ms=times_ms,
-        conditions=conditions,
-        condition_column=resolved_condition_column,
-        channel=channel,
+        X=epochs.get_data(picks=config.channel)[:, 0, :],
+        times_ms=epochs.times * 1000.0,
+        fs=float(epochs.info["sfreq"]),
+        labels=_map_labels(epochs.metadata[condition_column], config.labels).to_numpy(),
+        channel=config.channel,
+        condition_column=condition_column,
     )
 
 
-def load_intake_subjects(
-    subjects: str | Sequence[str],
-    data_root: Path,
-    intake_filename: str,
-    channel: str,
-    condition_column: str,
-    lowpass_before_downsample_hz: float | None,
-    downsample: bool,
-    downsample_fs: float,
-    show_metadata_summary: bool,
-    metadata_max_values: int,
-    hjorth_channel: str,
-    hjorth_weights: dict[str, float],
-    hjorth_scale_reference: str,
-    positive_labels: set[str],
-    negative_labels: set[str],
-    positive_name: str,
-    negative_name: str,
-    unknown_name: str,
-    condition_auto_keywords: Sequence[str],
-) -> list[SubjectData]:
-    return [
-        load_intake_subject(
-            subject,
-            data_root=data_root,
-            intake_filename=intake_filename,
-            channel=channel,
-            condition_column=condition_column,
-            lowpass_before_downsample_hz=lowpass_before_downsample_hz,
-            downsample=downsample,
-            downsample_fs=downsample_fs,
-            show_metadata_summary=show_metadata_summary,
-            metadata_max_values=metadata_max_values,
-            hjorth_channel=hjorth_channel,
-            hjorth_weights=hjorth_weights,
-            hjorth_scale_reference=hjorth_scale_reference,
-            positive_labels=positive_labels,
-            negative_labels=negative_labels,
-            positive_name=positive_name,
-            negative_name=negative_name,
-            unknown_name=unknown_name,
-            condition_auto_keywords=condition_auto_keywords,
-        )
-        for subject in as_subject_list(subjects)
-    ]
+def make_synthetic_epochs(
+    subject: str = "demo_sub_001",
+    n_epochs: int = 40,
+    fs: float = 1000.0,
+    tmin_ms: float = -1000.0,
+    tmax_ms: float = 500.0,
+    freq_hz: float = 6.0,
+    phase_jitter_deg: float = 35.0,
+    noise_rel: float = 0.35,
+    seed: int = 7,
+    labels: LabelScheme = DEFAULT_LABELS,
+) -> EpochArrays:
+    """Synthetic theta epochs for testing without data.
+
+    Each epoch is a ``freq_hz`` sine whose phase at t=0 is near the BOSS target
+    (0 deg positive, 180 deg negative, every 5th epoch unknown/random) plus a
+    14 Hz component and white noise. Amplitudes are in volts (~8 uV).
+    """
+    rng = np.random.default_rng(seed)
+    times_ms = np.arange(tmin_ms, tmax_ms + 0.5 * 1000.0 / fs, 1000.0 / fs)
+    cycle = (labels.positive, labels.negative, labels.positive, labels.negative, labels.unknown)
+    epoch_labels = np.array([cycle[i % len(cycle)] for i in range(n_epochs)], dtype=object)
+    X = np.empty((n_epochs, len(times_ms)))
+    for i, label in enumerate(epoch_labels):
+        target = labels.target_deg(label)
+        phase0 = rng.uniform(0, 360) if target is None else target + rng.normal(0, phase_jitter_deg)
+        # cos(2*pi*f*t + phi) has Hilbert phase phi at t=0 (0 deg = peak, matching to_0_360).
+        theta = np.cos(2 * np.pi * freq_hz * times_ms / 1000.0 + np.radians(phase0))
+        beta = 0.25 * np.sin(2 * np.pi * 14.0 * times_ms / 1000.0 + rng.uniform(0, 2 * np.pi))
+        X[i] = (theta + beta + rng.normal(0, noise_rel, size=times_ms.shape)) * 8e-6
+    return EpochArrays(
+        subject=subject,
+        X=X,
+        times_ms=times_ms,
+        fs=float(fs),
+        labels=epoch_labels,
+        channel="synthetic",
+        condition_column="synthetic",
+    )
+
+
+# ---- Phase estimation ----------------------------------------------------
+
+@dataclass
+class CausalEstimate:
+    phase_rad: float
+    phase_deg: float
+    amplitude: float
+    core: np.ndarray
+    pred_future: np.ndarray
+    core_times_ms: np.ndarray
+    future_times_ms: np.ndarray
+    params: dict[str, float | int]
+    phase_error_deg: float | None = None
+
+
+@dataclass
+class TrialEstimate:
+    subject: str
+    epoch_index: int
+    label: str
+    phase_rad: float
+    phase_deg: float
+    amplitude: float
+    raw: np.ndarray
+    filtered: np.ndarray
+    times_ms: np.ndarray
+    channel: str
+    noncausal_filter_order: int
+    causal: CausalEstimate | None = None
 
 
 def to_0_360(phase_rad: float | np.ndarray) -> float | np.ndarray:
@@ -325,7 +363,16 @@ def cutoff_index(times_ms: np.ndarray, cutoff_ms: float) -> int:
     return int(np.argmin(np.abs(times_ms - cutoff_ms)))
 
 
-def _noncausal_phase_estimate_with_filter(
+def bandpass_fir(fs: float, band: tuple[float, float], filter_order: int) -> np.ndarray:
+    """Windowed-sinc FIR band-pass taps (``filter_order + 1`` taps).
+
+    Longer filters give sharper band edges but need more signal; at 1000 Hz a 4-8 Hz
+    band typically uses orders 150-450.
+    """
+    return design_bandpass(filter_order, band[0], band[1], fs)
+
+
+def _noncausal_phase_with_filter(
     x: np.ndarray,
     times_ms: np.ndarray,
     bandpass_filter: np.ndarray,
@@ -344,7 +391,7 @@ def _noncausal_phase_estimate_with_filter(
     }
 
 
-def noncausal_phase_estimate(
+def noncausal_phase(
     x: np.ndarray,
     times_ms: np.ndarray,
     fs: float,
@@ -352,17 +399,22 @@ def noncausal_phase_estimate(
     filter_order: int,
     cutoff_ms: float,
 ) -> dict:
-    """Estimate offline/non-causal phase at cutoff using filtfilt + Hilbert."""
-    b = design_bandpass(filter_order, band[0], band[1], fs)
-    return _noncausal_phase_estimate_with_filter(x, times_ms, b, cutoff_ms)
+    """Offline ("ground truth") phase at ``cutoff_ms``.
+
+    Zero-phase ``filtfilt`` with an FIR band-pass over the whole epoch, then Hilbert;
+    phase and amplitude are read at the sample nearest ``cutoff_ms``. Uses future
+    samples, so it cannot run online.
+
+    Returns
+    -------
+    dict
+        ``phase_rad`` (-pi..pi), ``phase_deg`` (0..360, 0 = peak, 180 = trough),
+        ``amplitude`` (signal units), ``filtered`` (full filtered epoch).
+    """
+    return _noncausal_phase_with_filter(x, times_ms, bandpass_fir(fs, band, filter_order), cutoff_ms)
 
 
-def _causal_core_times(
-    times_ms: np.ndarray,
-    cutoff: int,
-    window_samples: int,
-    edge: int,
-) -> np.ndarray:
+def _causal_core_times(times_ms: np.ndarray, cutoff: int, window_samples: int, edge: int) -> np.ndarray:
     window_times = times_ms[cutoff - window_samples:cutoff]
     return window_times[edge:-edge] if edge else window_times
 
@@ -380,14 +432,14 @@ def _causal_params_are_feasible(
     return cutoff - window_samples >= 0 and window_samples > filter_order and core_len > ar_order + 10
 
 
-def _causal_phase_estimate_with_filter(
+def _causal_phase_with_filter(
     x: np.ndarray,
     times_ms: np.ndarray,
     fs: float,
     bandpass_filter: np.ndarray,
     cutoff_ms: float,
     params: dict[str, float | int],
-) -> dict | None:
+) -> CausalEstimate | None:
     cutoff = cutoff_index(times_ms, cutoff_ms)
     window_ms = float(params["window_ms"])
     filter_order = int(params["filter_order"])
@@ -421,41 +473,39 @@ def _causal_phase_estimate_with_filter(
         return None
 
     future_times_ms = core_times_ms[-1] + (np.arange(1, len(pred_future) + 1) / fs * 1000.0)
-    return {
-        "phase_rad": float(phase_rad),
-        "phase_deg": float(to_0_360(phase_rad)),
-        "amplitude": float(amplitude),
-        "core": core,
-        "pred_future": pred_future,
-        "core_times_ms": core_times_ms,
-        "future_times_ms": future_times_ms,
-        "params": dict(params),
-    }
+    return CausalEstimate(
+        phase_rad=float(phase_rad),
+        phase_deg=float(to_0_360(phase_rad)),
+        amplitude=float(amplitude),
+        core=core,
+        pred_future=pred_future,
+        core_times_ms=core_times_ms,
+        future_times_ms=future_times_ms,
+        params=dict(params),
+    )
 
 
-def causal_phase_estimate(
+def causal_phase(
     x: np.ndarray,
     times_ms: np.ndarray,
     fs: float,
     band: tuple[float, float],
     cutoff_ms: float,
     params: dict[str, float | int],
-) -> dict | None:
-    """Estimate online/causal phase at cutoff using phastimate's AR forecast."""
-    b = design_bandpass(int(params["filter_order"]), band[0], band[1], fs)
-    return _causal_phase_estimate_with_filter(x, times_ms, fs, b, cutoff_ms, params)
+) -> CausalEstimate | None:
+    """Online-style phase at ``cutoff_ms`` using only samples before it (phastimate).
+
+    Takes the ``window_ms`` before the cutoff, band-passes it, trims ``edge`` samples
+    at both ends, fits a Yule-Walker AR(``ar_order``) model, forecasts forward, and reads
+    the phase from a Hilbert transform over the last ``hilbert_window`` samples.
+    Returns None when the parameters don't fit in the epoch or the estimate fails.
+    """
+    params = validate_causal_params(params)
+    b = bandpass_fir(fs, band, int(params["filter_order"]))
+    return _causal_phase_with_filter(x, times_ms, fs, b, cutoff_ms, params)
 
 
-def signed_angular_difference_deg(a_deg: float, b_deg: float) -> float:
-    """Signed circular difference a-b in degrees, wrapped to (-180, 180]."""
-    return float((a_deg - b_deg + 180.0) % 360.0 - 180.0)
-
-
-def _circular_variance(errors_rad: Sequence[float]) -> float:
-    return float(1.0 - np.abs(np.mean(np.exp(1j * np.asarray(errors_rad)))))
-
-
-def _validate_causal_params(params: dict[str, float | int]) -> dict[str, float | int]:
+def validate_causal_params(params: dict[str, float | int]) -> dict[str, float | int]:
     required = ("window_ms", "filter_order", "edge", "ar_order", "hilbert_window", "offset")
     missing = [key for key in required if key not in params]
     if missing:
@@ -470,8 +520,134 @@ def _validate_causal_params(params: dict[str, float | int]) -> dict[str, float |
     }
 
 
+def resolve_noncausal_filter_order(
+    causal_params: dict[str, float | int] | None,
+    default_filter_order: int,
+) -> int:
+    """Filter order for the non-causal (ground-truth) estimate.
+
+    With causal params (manual or optimized) the non-causal estimate uses the same
+    ``filter_order`` as the causal one, so both methods see an identical band-pass;
+    the optimizer scores parameter sets the same way. Without causal estimation the
+    default is used. In manual mode the causal ``filter_order`` normally equals the
+    default, so this only differs per subject in optimize mode.
+    """
+    if causal_params is None:
+        return int(default_filter_order)
+    return int(causal_params["filter_order"])
+
+
+def _limit_trials(X: np.ndarray, n_trials: int | bool) -> np.ndarray:
+    return X if not n_trials else X[:min(int(n_trials), len(X))]
+
+
+def signed_angular_difference_deg(a_deg: float, b_deg: float) -> float:
+    """Signed circular difference a-b in degrees, wrapped to [-180, 180)."""
+    return float((a_deg - b_deg + 180.0) % 360.0 - 180.0)
+
+
+def estimate_subject_trials(
+    data: EpochArrays,
+    band: tuple[float, float],
+    filter_order: int,
+    cutoff_ms: float,
+    n_trials: int | bool,
+    causal_params: dict[str, float | int] | None,
+) -> list[TrialEstimate]:
+    """Non-causal (and optional causal) phase for every epoch of one subject.
+
+    ``filter_order`` is the non-causal filter order; see ``resolve_noncausal_filter_order``.
+    """
+    X = _limit_trials(data.X, n_trials)
+    noncausal_filter = bandpass_fir(data.fs, band, filter_order)
+    causal_filter = None
+    if causal_params is not None:
+        causal_params = validate_causal_params(causal_params)
+        causal_filter = bandpass_fir(data.fs, band, int(causal_params["filter_order"]))
+
+    estimates = []
+    for i, (x, label) in enumerate(zip(X, data.labels)):
+        est = _noncausal_phase_with_filter(x, data.times_ms, noncausal_filter, cutoff_ms)
+        causal = None
+        if causal_filter is not None:
+            causal = _causal_phase_with_filter(x, data.times_ms, data.fs, causal_filter, cutoff_ms, causal_params)
+            if causal is not None:
+                causal.phase_error_deg = signed_angular_difference_deg(causal.phase_deg, est["phase_deg"])
+
+        estimates.append(
+            TrialEstimate(
+                subject=data.subject,
+                epoch_index=i,
+                label=label,
+                phase_rad=est["phase_rad"],
+                phase_deg=est["phase_deg"],
+                amplitude=est["amplitude"],
+                raw=x,
+                filtered=est["filtered"],
+                times_ms=data.times_ms,
+                channel=data.channel,
+                noncausal_filter_order=int(filter_order),
+                causal=causal,
+            )
+        )
+    return estimates
+
+
+def estimate_all_subjects(
+    subject_data: Iterable[EpochArrays],
+    band: tuple[float, float],
+    filter_order: int,
+    cutoff_ms: float,
+    n_trials: int | bool,
+    causal_estimation: bool,
+    causal_params_mode: str,
+    manual_causal_params: dict[str, float | int],
+    optimization_config: dict,
+) -> dict[str, list[TrialEstimate]]:
+    """Estimate phases for each subject.
+
+    ``causal_params_mode``: ``"manual"`` uses ``manual_causal_params`` for everyone;
+    ``"optimize"`` fits one causal parameter set per subject (``optimize_causal_params``).
+    """
+    estimates_by_subject = {}
+    for data in subject_data:
+        causal_params = None
+        if causal_estimation:
+            if causal_params_mode == "manual":
+                causal_params = validate_causal_params(manual_causal_params)
+            elif causal_params_mode == "optimize":
+                causal_params = optimize_causal_params(
+                    data.X,
+                    data.times_ms,
+                    data.fs,
+                    band=band,
+                    cutoff_ms=cutoff_ms,
+                    optimization_config=optimization_config,
+                    n_trials=n_trials,
+                    name=data.subject,
+                )
+            else:
+                raise ValueError("causal_params_mode must be 'manual' or 'optimize'.")
+
+        estimates_by_subject[data.subject] = estimate_subject_trials(
+            data,
+            band=band,
+            filter_order=resolve_noncausal_filter_order(causal_params, filter_order),
+            cutoff_ms=cutoff_ms,
+            n_trials=n_trials,
+            causal_params=causal_params,
+        )
+    return estimates_by_subject
+
+
+# ---- Causal parameter optimization --------------------------------------
+
+def _circular_variance(errors_rad: Sequence[float]) -> float:
+    return float(1.0 - np.abs(np.mean(np.exp(1j * np.asarray(errors_rad)))))
+
+
 def _evaluate_causal_params(
-    data: np.ndarray,
+    X: np.ndarray,
     indices: Sequence[int],
     times_ms: np.ndarray,
     fs: float,
@@ -480,7 +656,7 @@ def _evaluate_causal_params(
     params: dict[str, float | int],
     min_usable_trials: int,
 ) -> dict | None:
-    params = _validate_causal_params(params)
+    params = validate_causal_params(params)
     cutoff = cutoff_index(times_ms, cutoff_ms)
     if not _causal_params_are_feasible(
         cutoff,
@@ -492,17 +668,17 @@ def _evaluate_causal_params(
     ):
         return None
 
-    b = design_bandpass(int(params["filter_order"]), band[0], band[1], fs)
+    b = bandpass_fir(fs, band, int(params["filter_order"]))
     errors_rad = []
     for i in indices:
         try:
-            causal = _causal_phase_estimate_with_filter(data[i], times_ms, fs, b, cutoff_ms, params)
+            causal = _causal_phase_with_filter(X[i], times_ms, fs, b, cutoff_ms, params)
             if causal is None:
                 continue
-            noncausal = _noncausal_phase_estimate_with_filter(data[i], times_ms, b, cutoff_ms)
+            noncausal = _noncausal_phase_with_filter(X[i], times_ms, b, cutoff_ms)
         except Exception:
             continue
-        errors_rad.append(causal["phase_rad"] - noncausal["phase_rad"])
+        errors_rad.append(causal.phase_rad - noncausal["phase_rad"])
 
     if len(errors_rad) < min_usable_trials:
         return None
@@ -517,7 +693,7 @@ def _evaluate_causal_params(
 
 
 def _make_causal_optimization_objective(
-    data: np.ndarray,
+    X: np.ndarray,
     train_idx: np.ndarray,
     times_ms: np.ndarray,
     fs: float,
@@ -547,7 +723,7 @@ def _make_causal_optimization_objective(
             "offset": optimization_config["offset"],
         }
         result = _evaluate_causal_params(
-            data,
+            X,
             train_idx,
             times_ms,
             fs,
@@ -563,33 +739,41 @@ def _make_causal_optimization_objective(
     return objective
 
 
-def optimize_causal_params_for_subject(
-    subject_data: SubjectData,
+def optimize_causal_params(
+    X: np.ndarray,
+    times_ms: np.ndarray,
+    fs: float,
     band: tuple[float, float],
     cutoff_ms: float,
-    n_trials: int | bool,
     optimization_config: dict,
+    n_trials: int | bool = False,
+    name: str = "data",
 ) -> dict[str, float | int]:
-    """Choose one causal AR parameter set for a subject against non-causal phase."""
+    """Choose one causal AR parameter set against the non-causal phase (Optuna TPE).
+
+    Epochs are split into train/held-out (``train_fraction``). Each Optuna trial (one
+    candidate parameter set, ``n_opt_trials`` in total) is scored by the circular
+    variance of (causal - non-causal) phase over training epochs; lower is better.
+    Both estimates use the candidate ``filter_order``. Held-out performance is printed.
+    """
     try:
         import optuna
     except ImportError as exc:
         raise ImportError("Optimization mode requires optuna. Install the project requirements first.") from exc
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    n = len(subject_data.data) if not n_trials else min(int(n_trials), len(subject_data.data))
-    data = subject_data.data[:n]
-    if len(data) == 0:
-        raise ValueError(f"No trials available for {subject_data.subject}.")
+    X = _limit_trials(X, n_trials)
+    if len(X) == 0:
+        raise ValueError(f"No trials available for {name}.")
 
     rng = np.random.default_rng(int(optimization_config["random_seed"]))
-    shuffled = rng.permutation(len(data))
-    if len(data) == 1:
+    shuffled = rng.permutation(len(X))
+    if len(X) == 1:
         train_idx = shuffled
         test_idx = np.array([], dtype=int)
     else:
-        n_train = round(len(data) * float(optimization_config["train_fraction"]))
-        n_train = min(max(n_train, 1), len(data) - 1)
+        n_train = round(len(X) * float(optimization_config["train_fraction"]))
+        n_train = min(max(n_train, 1), len(X) - 1)
         train_idx = shuffled[:n_train]
         test_idx = shuffled[n_train:]
 
@@ -598,19 +782,11 @@ def optimize_causal_params_for_subject(
         sampler=optuna.samplers.TPESampler(seed=int(optimization_config["random_seed"])),
     )
     study.optimize(
-        _make_causal_optimization_objective(
-            data,
-            train_idx,
-            subject_data.times_ms,
-            subject_data.fs,
-            band,
-            cutoff_ms,
-            optimization_config,
-        ),
+        _make_causal_optimization_objective(X, train_idx, times_ms, fs, band, cutoff_ms, optimization_config),
         n_trials=int(optimization_config["n_opt_trials"]),
     )
 
-    best_params = _validate_causal_params(
+    best_params = validate_causal_params(
         {
             **study.best_params,
             "hilbert_window": optimization_config["hilbert_window"],
@@ -618,32 +794,25 @@ def optimize_causal_params_for_subject(
         }
     )
     train_result = _evaluate_causal_params(
-        data,
+        X,
         train_idx,
-        subject_data.times_ms,
-        subject_data.fs,
+        times_ms,
+        fs,
         band,
         cutoff_ms,
         best_params,
         min_usable_trials=optimization_config["min_usable_trials"],
     )
     if train_result is None:
-        raise RuntimeError(f"No feasible causal AR parameters found for {subject_data.subject}.")
+        raise RuntimeError(f"No feasible causal AR parameters found for {name}.")
 
     test_result = None
     if len(test_idx):
         test_result = _evaluate_causal_params(
-            data,
-            test_idx,
-            subject_data.times_ms,
-            subject_data.fs,
-            band,
-            cutoff_ms,
-            best_params,
-            min_usable_trials=1,
+            X, test_idx, times_ms, fs, band, cutoff_ms, best_params, min_usable_trials=1
         )
 
-    print(f"\n[{subject_data.subject}] optimized causal AR params: {best_params}")
+    print(f"\n[{name}] optimized causal AR params: {best_params}")
     print(
         "  train: "
         f"circular variance {train_result['circular_variance']:.4f}, "
@@ -663,613 +832,401 @@ def optimize_causal_params_for_subject(
     return best_params
 
 
-def estimate_subject_trials(
-    subject_data: SubjectData,
-    band: tuple[float, float],
-    filter_order: int,
-    cutoff_ms: float,
-    n_trials: int | bool,
-    phase_class_tolerance_deg: float,
-    positive_name: str,
-    negative_name: str,
-    unclassified_name: str,
-    causal_params: dict[str, float | int] | None,
-) -> list[TrialEstimate]:
-    n = len(subject_data.data) if not n_trials else min(int(n_trials), len(subject_data.data))
-    estimates = []
-    noncausal_filter = design_bandpass(filter_order, band[0], band[1], subject_data.fs)
-    causal_filter = None
-    if causal_params is not None:
-        causal_params = _validate_causal_params(causal_params)
-        causal_filter = design_bandpass(int(causal_params["filter_order"]), band[0], band[1], subject_data.fs)
-
-    for i, (x, condition) in enumerate(zip(subject_data.data[:n], subject_data.conditions[:n])):
-        est = _noncausal_phase_estimate_with_filter(
-            x,
-            subject_data.times_ms,
-            noncausal_filter,
-            cutoff_ms,
-        )
-        noncausal_class = phase_class(
-            est["phase_deg"],
-            tolerance_deg=phase_class_tolerance_deg,
-            positive_name=positive_name,
-            negative_name=negative_name,
-            unclassified_name=unclassified_name,
-        )
-        causal_est = None
-        causal_class = None
-        causal_phase_error_deg = None
-        if causal_params is not None and causal_filter is not None:
-            causal_est = _causal_phase_estimate_with_filter(
-                x,
-                subject_data.times_ms,
-                subject_data.fs,
-                causal_filter,
-                cutoff_ms,
-                causal_params,
-            )
-            if causal_est is not None:
-                causal_class = phase_class(
-                    causal_est["phase_deg"],
-                    tolerance_deg=phase_class_tolerance_deg,
-                    positive_name=positive_name,
-                    negative_name=negative_name,
-                    unclassified_name=unclassified_name,
-                )
-                causal_phase_error_deg = signed_angular_difference_deg(
-                    causal_est["phase_deg"],
-                    est["phase_deg"],
-                )
-
-        estimates.append(
-            TrialEstimate(
-                subject=subject_data.subject,
-                epoch_index=i,
-                condition=condition,
-                noncausal_class=noncausal_class,
-                phase_rad=est["phase_rad"],
-                phase_deg=est["phase_deg"],
-                amplitude=est["amplitude"],
-                raw=x,
-                filtered=est["filtered"],
-                times_ms=subject_data.times_ms,
-                channel=subject_data.channel,
-                causal_class=causal_class,
-                causal_phase_rad=None if causal_est is None else causal_est["phase_rad"],
-                causal_phase_deg=None if causal_est is None else causal_est["phase_deg"],
-                causal_amplitude=None if causal_est is None else causal_est["amplitude"],
-                causal_core=None if causal_est is None else causal_est["core"],
-                causal_pred_future=None if causal_est is None else causal_est["pred_future"],
-                causal_core_times_ms=None if causal_est is None else causal_est["core_times_ms"],
-                causal_future_times_ms=None if causal_est is None else causal_est["future_times_ms"],
-                causal_phase_error_deg=causal_phase_error_deg,
-                causal_params=None if causal_params is None else dict(causal_params),
-            )
-        )
-    return estimates
-
-
-def estimate_all_subjects(
-    subject_data: Iterable[SubjectData],
-    band: tuple[float, float],
-    filter_order: int,
-    cutoff_ms: float,
-    n_trials: int | bool,
-    phase_class_tolerance_deg: float,
-    positive_name: str,
-    negative_name: str,
-    unclassified_name: str,
-    causal_estimation: bool,
-    causal_params_mode: str,
-    manual_causal_params: dict[str, float | int],
-    optimization_config: dict,
-) -> dict[str, list[TrialEstimate]]:
-    estimates_by_subject = {}
-    for data in subject_data:
-        causal_params = None
-        subject_filter_order = filter_order
-        if causal_estimation:
-            if causal_params_mode == "manual":
-                causal_params = _validate_causal_params(manual_causal_params)
-            elif causal_params_mode == "optimize":
-                causal_params = optimize_causal_params_for_subject(
-                    data,
-                    band=band,
-                    cutoff_ms=cutoff_ms,
-                    n_trials=n_trials,
-                    optimization_config=optimization_config,
-                )
-            else:
-                raise ValueError("causal_params_mode must be 'manual' or 'optimize'.")
-            subject_filter_order = int(causal_params["filter_order"])
-
-        estimates_by_subject[data.subject] = estimate_subject_trials(
-            data,
-            band=band,
-            filter_order=subject_filter_order,
-            cutoff_ms=cutoff_ms,
-            n_trials=n_trials,
-            phase_class_tolerance_deg=phase_class_tolerance_deg,
-            positive_name=positive_name,
-            negative_name=negative_name,
-            unclassified_name=unclassified_name,
-            causal_params=causal_params,
-        )
-    return estimates_by_subject
-
-
-def print_phase_summary(
-    estimates_by_subject: dict[str, list[TrialEstimate]],
-    class_order: Sequence[str],
-    positive_name: str,
-    negative_name: str,
-    unclassified_name: str,
-) -> None:
-    for subject, estimates in estimates_by_subject.items():
-        has_causal = any(est.causal_phase_deg is not None for est in estimates)
-        title = "phase estimates" if has_causal else "non-causal phase estimates"
-        print(f"\n[{subject}] {title}: n={len(estimates)}")
-        for condition in class_order:
-            selected = [est.phase_deg for est in estimates if est.condition == condition]
-            if selected:
-                print(
-                    f"  {condition:>8s}: n={len(selected)}, "
-                    f"non-causal mean={circular_mean_deg(selected):.1f} deg"
-                )
-                causal_selected = [
-                    est.causal_phase_deg for est in estimates
-                    if est.condition == condition and est.causal_phase_deg is not None
-                ]
-                if causal_selected:
-                    print(f"            causal mean={circular_mean_deg(causal_selected):.1f} deg")
-        for phase_class_name in (positive_name, negative_name, unclassified_name):
-            selected = [est for est in estimates if est.noncausal_class == phase_class_name]
-            if selected:
-                print(f"  non-causal {phase_class_name:>12s}: n={len(selected)}")
-            if has_causal:
-                causal_selected = [est for est in estimates if est.causal_class == phase_class_name]
-                if causal_selected:
-                    print(f"      causal {phase_class_name:>12s}: n={len(causal_selected)}")
-        counts = boss_vs_noncausal_counts(estimates, positive_name, negative_name, unclassified_name)
-        if counts["compared"]:
-            print(
-                f"  BOSS wrong vs non-causal: {counts['wrong']}/{counts['compared']} "
-                f"({100 * counts['wrong'] / counts['compared']:.1f}%)"
-            )
-        if has_causal:
-            causal_counts = boss_vs_causal_counts(estimates, positive_name, negative_name, unclassified_name)
-            if causal_counts["compared"]:
-                print(
-                    f"  BOSS wrong vs causal:     {causal_counts['wrong']}/{causal_counts['compared']} "
-                    f"({100 * causal_counts['wrong'] / causal_counts['compared']:.1f}%)"
-                )
-
-
-def circular_mean_deg(values_deg: Sequence[float]) -> float:
-    values_rad = np.radians(values_deg)
-    return float(np.degrees(np.angle(np.mean(np.exp(1j * values_rad)))) % 360.0)
-
+# ---- Classification, scoring and deviations -----------------------------
 
 def angular_distance_deg(a_deg: float, b_deg: float) -> float:
     """Smallest absolute circular distance between two angles in degrees."""
     return abs((a_deg - b_deg + 180.0) % 360.0 - 180.0)
 
 
-def phase_class(
-    phase_deg: float,
+def classify_phase(
+    phase_deg: float | None,
     tolerance_deg: float,
-    positive_name: str,
-    negative_name: str,
-    unclassified_name: str,
-) -> str:
-    """Classify phase only inside windows around 0 and 180 degrees."""
+    labels: LabelScheme = DEFAULT_LABELS,
+) -> str | None:
+    """Positive if within +/-tolerance of 0 deg, negative if within +/-tolerance of 180 deg.
+
+    Anything else is ``labels.unclassified``; a missing phase (None/NaN) returns None.
+    """
+    if phase_deg is None or (isinstance(phase_deg, float) and np.isnan(phase_deg)):
+        return None
     positive_distance = angular_distance_deg(phase_deg, 0.0)
     negative_distance = angular_distance_deg(phase_deg, 180.0)
     is_positive = positive_distance <= tolerance_deg
     is_negative = negative_distance <= tolerance_deg
 
     if is_positive and is_negative:
-        return positive_name if positive_distance <= negative_distance else negative_name
+        return labels.positive if positive_distance <= negative_distance else labels.negative
     if is_positive:
-        return positive_name
+        return labels.positive
     if is_negative:
-        return negative_name
-    return unclassified_name
+        return labels.negative
+    return labels.unclassified
 
 
-def boss_vs_noncausal_counts(
-    estimates: Sequence[TrialEstimate],
-    positive_name: str,
-    negative_name: str,
-    unclassified_name: str,
-) -> dict[str, int]:
-    return boss_vs_phase_method_counts(
-        estimates,
-        method="noncausal",
-        positive_name=positive_name,
-        negative_name=negative_name,
-        unclassified_name=unclassified_name,
-    )
+def comparison_status(boss_label: str, phase_class: str | None, labels: LabelScheme = DEFAULT_LABELS) -> str:
+    """``correct`` / ``wrong`` / ``unclassified`` (or missing phase) / ``unknown`` (no BOSS label)."""
+    if boss_label not in (labels.positive, labels.negative):
+        return "unknown"
+    if phase_class is None or phase_class == labels.unclassified:
+        return "unclassified"
+    return "correct" if phase_class == boss_label else "wrong"
 
 
-def boss_vs_causal_counts(
-    estimates: Sequence[TrialEstimate],
-    positive_name: str,
-    negative_name: str,
-    unclassified_name: str,
-) -> dict[str, int]:
-    return boss_vs_phase_method_counts(
-        estimates,
-        method="causal",
-        positive_name=positive_name,
-        negative_name=negative_name,
-        unclassified_name=unclassified_name,
-    )
+def chance_success_pct(tolerance_deg: float) -> float:
+    """Chance of a uniformly random phase landing in the correct +/-T window: 2T/360."""
+    return 100.0 * 2.0 * tolerance_deg / 360.0
 
 
-def boss_vs_phase_method_counts(
-    estimates: Sequence[TrialEstimate],
-    method: str,
-    positive_name: str,
-    negative_name: str,
-    unclassified_name: str,
-) -> dict[str, int]:
-    comparable_classes = {positive_name, negative_name}
-    compared = [
-        est for est in estimates
-        if est.condition in comparable_classes and _phase_method_class(est, method) in comparable_classes
-    ]
-    wrong = [est for est in compared if est.condition != _phase_method_class(est, method)]
-    unclassified = [est for est in estimates if _phase_method_class(est, method) == unclassified_name]
+def score_vs_boss(
+    boss_labels: Sequence[str],
+    phases_deg: Sequence[float | None],
+    tolerance_deg: float,
+    labels: LabelScheme = DEFAULT_LABELS,
+) -> dict[str, float | int | None]:
+    """BOSS success at one tolerance.
+
+    Only BOSS-labeled (positive/negative) epochs count. ``success_pct`` =
+    correct / n_labeled * 100, so unclassified epochs count as failures.
+    ``by_class`` gives n and correct separately for BOSS positive and negative.
+    """
+    counts = {"correct": 0, "wrong": 0, "unclassified": 0}
+    by_class = {name: {"n": 0, "correct": 0} for name in (labels.positive, labels.negative)}
+    for boss, phase in zip(boss_labels, phases_deg):
+        status = comparison_status(boss, classify_phase(phase, tolerance_deg, labels), labels)
+        if status == "unknown":
+            continue
+        counts[status] += 1
+        by_class[boss]["n"] += 1
+        by_class[boss]["correct"] += status == "correct"
+    n_labeled = sum(counts.values())
     return {
-        "compared": len(compared),
-        "wrong": len(wrong),
-        "correct": len(compared) - len(wrong),
-        "unclassified": len(unclassified),
+        "n_labeled": n_labeled,
+        **counts,
+        "success_pct": 100.0 * counts["correct"] / n_labeled if n_labeled else None,
+        "by_class": by_class,
     }
 
 
-def boss_class_counts(
-    estimates: Sequence[TrialEstimate],
-    class_name: str,
-    method: str,
-) -> dict[str, int]:
-    boss_trials = [est for est in estimates if est.condition == class_name]
-    correct = [est for est in boss_trials if _phase_method_class(est, method) == class_name]
-    return {"n_boss": len(boss_trials), "n_correct": len(correct)}
+def phase_deviation_deg(phase_deg: float, target_deg: float) -> float:
+    """Signed deviation of a phase from a target, wrapped to [-180, 180)."""
+    return signed_angular_difference_deg(phase_deg, target_deg)
 
 
-def _phase_method_class(estimate: TrialEstimate, method: str) -> str | None:
-    if method == "noncausal":
-        return estimate.noncausal_class
-    if method == "causal":
-        return estimate.causal_class
-    raise ValueError("method must be 'noncausal' or 'causal'.")
+def boss_target_deviations(
+    boss_labels: Sequence[str],
+    phases_deg: Sequence[float | None],
+    labels: LabelScheme = DEFAULT_LABELS,
+) -> np.ndarray:
+    """Signed deviation of each phase from its BOSS target (NaN for unknown label or phase)."""
+    out = np.full(len(boss_labels), np.nan)
+    for i, (boss, phase) in enumerate(zip(boss_labels, phases_deg)):
+        target = labels.target_deg(boss)
+        if target is not None and phase is not None and not np.isnan(phase):
+            out[i] = phase_deviation_deg(phase, target)
+    return out
 
 
-def _phase_method_deg(estimate: TrialEstimate, method: str) -> float | None:
-    if method == "noncausal":
-        return estimate.phase_deg
-    if method == "causal":
-        return estimate.causal_phase_deg
-    raise ValueError("method must be 'noncausal' or 'causal'.")
+def circular_stats(deviations_deg: Sequence[float], tolerances_deg: Sequence[float] = ()) -> dict:
+    """Circular summary of signed deviations (NaNs ignored).
+
+    ``mean_deg``: circular mean (bias); ``R``: mean resultant length (1 = all equal);
+    ``sd_deg``: circular SD = sqrt(-2 ln R); ``pct_within``: % with |deviation| <= T.
+    """
+    values = np.asarray(deviations_deg, dtype=float)
+    values = values[~np.isnan(values)]
+    n = len(values)
+    if n == 0:
+        return {"n": 0, "mean_deg": None, "sd_deg": None, "R": None, "pct_within": {str(t): None for t in tolerances_deg}}
+    vector = np.mean(np.exp(1j * np.radians(values)))
+    R = float(np.abs(vector))
+    return {
+        "n": n,
+        "mean_deg": signed_angular_difference_deg(float(np.degrees(np.angle(vector))), 0.0),
+        "sd_deg": float(np.degrees(np.sqrt(-2.0 * np.log(R)))) if R > 0 else None,
+        "R": R,
+        "pct_within": {str(t): float(100.0 * np.mean(np.abs(values) <= t)) for t in tolerances_deg},
+    }
 
 
-def comparison_status(
-    estimate: TrialEstimate,
-    method: str,
-    positive_name: str,
-    negative_name: str,
-    unclassified_name: str,
-) -> str:
-    comparable_classes = {positive_name, negative_name}
-    phase_class_name = _phase_method_class(estimate, method)
-    if estimate.condition not in comparable_classes:
-        return "unknown_boss"
-    if phase_class_name is None:
-        return "unclassified"
-    if phase_class_name == unclassified_name:
-        return "unclassified"
-    if phase_class_name == estimate.condition:
-        return "correct"
-    return "wrong"
+def deviation_histogram(
+    deviations_deg: Sequence[float],
+    boss_labels: Sequence[str],
+    bin_width_deg: float = 10.0,
+    labels: LabelScheme = DEFAULT_LABELS,
+) -> dict:
+    """Counts per bin from -180 to 180, split by BOSS class (NaNs dropped)."""
+    edges = np.arange(-180.0, 180.0 + bin_width_deg / 2, bin_width_deg)
+    values = np.asarray(deviations_deg, dtype=float)
+    boss = np.asarray(boss_labels, dtype=object)
+    keep = ~np.isnan(values)
+    counts = {}
+    for class_name in labels.class_order:
+        selected = values[keep & (boss == class_name)]
+        counts[class_name] = np.histogram(selected, bins=edges)[0].astype(int).tolist()
+    return {"bin_edges_deg": edges.tolist(), "counts_by_class": counts}
 
 
-def plot_intake_phase_circle(
-    estimates_by_subject: dict[str, list[TrialEstimate]],
-    causal_estimation: bool,
-    cutoff_ms: float,
-    band: tuple[float, float],
-    phase_class_tolerance_deg: float,
-    class_order: Sequence[str],
-    class_colors: dict[str, str],
-    positive_name: str,
-    negative_name: str,
-    unclassified_name: str,
-    show: bool,
-    save_path: str | Path | None = None,
-):
-    """Circular phase plot colored by BOSS label. Click points for signal plots."""
-    figures = []
-    n_subjects = len(estimates_by_subject)
-    for subject, estimates in estimates_by_subject.items():
-        fig = _plot_one_subject_phase_circle(
-            subject=subject,
-            estimates=estimates,
-            causal_estimation=causal_estimation,
-            cutoff_ms=cutoff_ms,
-            band=band,
-            phase_class_tolerance_deg=phase_class_tolerance_deg,
-            class_order=class_order,
-            class_colors=class_colors,
-            positive_name=positive_name,
-            negative_name=negative_name,
-            unclassified_name=unclassified_name,
-        )
-        if save_path is not None:
-            fig.savefig(_save_path_for_subject(save_path, subject, n_subjects), dpi=150)
-        figures.append(fig)
-
-    if show:
-        plt.show()
-    else:
-        for fig in figures:
-            plt.close(fig)
-    return figures[0] if len(figures) == 1 else figures
+def _sample_sd(values: Sequence[float]) -> float | None:
+    return float(np.std(values, ddof=1)) if len(values) > 1 else None
 
 
-def _plot_one_subject_phase_circle(
-    subject: str,
-    estimates: list[TrialEstimate],
-    causal_estimation: bool,
-    cutoff_ms: float,
-    band: tuple[float, float],
-    phase_class_tolerance_deg: float,
-    class_order: Sequence[str],
-    class_colors: dict[str, str],
-    positive_name: str,
-    negative_name: str,
-    unclassified_name: str,
-):
-    fig, ax = plt.subplots(figsize=(6.2, 5.4), subplot_kw={"projection": "polar"})
-    scatter_lookup = []
+def boss_success_by_tolerance(
+    subjects: dict[str, tuple[Sequence[str], Sequence[float]]],
+    tolerances_deg: Sequence[float],
+    labels: LabelScheme = DEFAULT_LABELS,
+) -> dict:
+    """Per-subject non-causal BOSS success for each tolerance, plus mean and sample SD across subjects.
 
-    _configure_phase_axis(ax, subject)
-    _shade_phase_windows(ax, phase_class_tolerance_deg)
+    ``subjects`` maps subject id -> (BOSS labels, non-causal phases in deg).
+    """
+    result = {"subjects": list(subjects), "tolerances_deg": list(tolerances_deg), "by_tolerance": {}}
+    for tol in tolerances_deg:
+        scores = [score_vs_boss(boss, phases, tol, labels) for boss, phases in subjects.values()]
+        pct = [s["success_pct"] for s in scores]
+        valid = [p for p in pct if p is not None]
+        result["by_tolerance"][str(tol)] = {
+            "success_pct": pct,
+            "correct": [s["correct"] for s in scores],
+            "n_labeled": [s["n_labeled"] for s in scores],
+            "mean_pct": float(np.mean(valid)) if valid else None,
+            "sd_pct": _sample_sd(valid),
+            "chance_pct": chance_success_pct(tol),
+        }
+    return result
 
-    radius_by_estimate = {}
-    for condition in class_order:
-        condition_estimates = [est for est in estimates if est.condition == condition]
-        for radius, estimate in enumerate(condition_estimates, start=1):
-            radius_by_estimate[id(estimate)] = radius
 
-    if causal_estimation:
-        for estimate in estimates:
-            if estimate.causal_phase_deg is None:
-                continue
-            radius = radius_by_estimate[id(estimate)]
-            theta = _short_arc_pair(np.radians(estimate.phase_deg), np.radians(estimate.causal_phase_deg))
-            ax.plot(theta, [radius, radius], color="0.55", lw=0.75, alpha=0.35, zorder=1)
+def analyze_phase_results(
+    subjects: dict[str, dict[str, Sequence]],
+    tolerances_deg: Sequence[float],
+    bin_width_deg: float = 10.0,
+    labels: LabelScheme = DEFAULT_LABELS,
+) -> dict:
+    """Everything the report shows, precomputed for every tolerance.
 
-    method_markers = [("noncausal", "o")]
-    if causal_estimation:
-        method_markers.append(("causal", "^"))
+    ``subjects`` maps subject id -> dict with per-epoch sequences ``boss`` (labels),
+    ``noncausal_deg``, ``causal_deg`` and ``causal_error_deg`` (None where missing).
 
-    for method, marker in method_markers:
-        for condition in class_order:
-            condition_estimates = [est for est in estimates if est.condition == condition]
-            for status in ("correct", "wrong", "unclassified", "unknown_boss"):
-                selected = [
-                    est for est in condition_estimates
-                    if _phase_method_deg(est, method) is not None
-                    and comparison_status(est, method, positive_name, negative_name, unclassified_name) == status
+    Returns per subject: per-epoch class/status for each method and tolerance, counts,
+    deviation histograms + circular stats (``causal_error`` = causal - non-causal,
+    ``boss_target`` = non-causal - BOSS target); the same histograms pooled over
+    subjects; and ``success`` from ``boss_success_by_tolerance``.
+    """
+    out = {"tolerances_deg": list(tolerances_deg), "subjects": {}, "pooled": {}}
+    pooled = {kind: ([], []) for kind in DEVIATION_KINDS}
+
+    for subject_id, data in subjects.items():
+        boss = list(data["boss"])
+        phases = {"noncausal": list(data["noncausal_deg"]), "causal": list(data["causal_deg"])}
+        subject_out = {"classes": {}, "status": {}, "counts": {}, "deviations": {}}
+        for method in METHODS:
+            subject_out["classes"][method] = {}
+            subject_out["status"][method] = {}
+            subject_out["counts"][method] = {}
+            for tol in tolerances_deg:
+                classes = [classify_phase(p, tol, labels) for p in phases[method]]
+                subject_out["classes"][method][str(tol)] = classes
+                subject_out["status"][method][str(tol)] = [
+                    comparison_status(b, c, labels) for b, c in zip(boss, classes)
                 ]
-                if not selected:
-                    continue
-                theta = np.radians([_phase_method_deg(est, method) for est in selected])
-                radius = [radius_by_estimate[id(est)] for est in selected]
-                scatter_kwargs = _scatter_style(
-                    class_colors[condition],
-                    status,
-                    marker,
-                    paired_methods=causal_estimation,
-                )
-                scatter = ax.scatter(
-                    theta,
-                    radius,
-                    picker=True,
-                    pickradius=6,
-                    label="_nolegend_",
-                    **scatter_kwargs,
-                )
-                scatter_lookup.append((scatter, selected))
+                subject_out["counts"][method][str(tol)] = score_vs_boss(boss, phases[method], tol, labels)
 
-    _add_boss_count_legend(
-        ax,
-        estimates,
-        class_colors,
-        positive_name,
-        negative_name,
-        causal_estimation=causal_estimation,
+        deviations = {
+            "causal_error": np.array([np.nan if v is None else v for v in data["causal_error_deg"]], dtype=float),
+            "boss_target": boss_target_deviations(boss, phases["noncausal"], labels),
+        }
+        for kind, values in deviations.items():
+            subject_out["deviations"][kind] = {
+                **deviation_histogram(values, boss, bin_width_deg, labels),
+                "stats": circular_stats(values, tolerances_deg),
+            }
+            pooled[kind][0].extend(values.tolist())
+            pooled[kind][1].extend(boss)
+        out["subjects"][subject_id] = subject_out
+
+    for kind, (values, boss) in pooled.items():
+        out["pooled"][kind] = {
+            **deviation_histogram(values, boss, bin_width_deg, labels),
+            "stats": circular_stats(values, tolerances_deg),
+        }
+
+    out["success"] = boss_success_by_tolerance(
+        {sid: (data["boss"], data["noncausal_deg"]) for sid, data in subjects.items()},
+        tolerances_deg,
+        labels,
     )
-    _add_method_marker_legend(ax, causal_estimation)
-    ax.legend(loc="upper right", fontsize=8, bbox_to_anchor=(1.38, 1.12))
-    fig.tight_layout()
-
-    def on_pick(event):
-        for scatter, selected in scatter_lookup:
-            if event.artist is scatter and len(event.ind):
-                plot_trial_signal(selected[event.ind[0]], cutoff_ms=cutoff_ms, band=band).show()
-                return
-
-    fig.canvas.mpl_connect("pick_event", on_pick)
-    return fig
+    return out
 
 
-def _short_arc_pair(theta_a: float, theta_b: float) -> list[float]:
-    if abs(theta_b - theta_a) <= np.pi:
-        return [theta_a, theta_b]
-    if theta_a < theta_b:
-        theta_a += 2.0 * np.pi
-    else:
-        theta_b += 2.0 * np.pi
-    return [theta_a, theta_b]
+def estimates_to_arrays(estimates: Sequence[TrialEstimate]) -> dict[str, list]:
+    """Per-epoch sequences in the shape ``analyze_phase_results`` expects."""
+    return {
+        "boss": [est.label for est in estimates],
+        "noncausal_deg": [est.phase_deg for est in estimates],
+        "causal_deg": [None if est.causal is None else est.causal.phase_deg for est in estimates],
+        "causal_error_deg": [None if est.causal is None else est.causal.phase_error_deg for est in estimates],
+    }
 
 
-def _save_path_for_subject(save_path: str | Path, subject: str, n_subjects: int) -> Path:
-    path = Path(save_path)
-    if n_subjects == 1:
-        return path
-    return path.with_name(f"{path.stem}_{subject}{path.suffix}")
-
-
-def _configure_phase_axis(ax, title: str) -> None:
-    ax.set_title(title)
-    ax.set_theta_zero_location("N")
-    ax.set_theta_direction(-1)
-    ax.set_yticklabels([])
-    ax.set_rlabel_position(90)
-    ax.set_xticks(np.radians([0, 90, 180, 270]))
-    ax.set_xticklabels(["0 deg", "90 deg", "180 deg", "270 deg"])
-    for target_deg in (0, 180):
-        ax.axvline(np.radians(target_deg), color="black", ls=":", lw=1, alpha=0.55)
-
-
-def _shade_phase_windows(ax, tolerance_deg: float) -> None:
-    for center_deg in (0.0, 180.0):
-        _shade_circular_window(ax, center_deg, tolerance_deg)
-
-
-def _shade_circular_window(ax, center_deg: float, tolerance_deg: float) -> None:
-    start_deg = (center_deg - tolerance_deg) % 360.0
-    end_deg = (center_deg + tolerance_deg) % 360.0
-    spans = [(start_deg, 360.0), (0.0, end_deg)] if start_deg > end_deg else [(start_deg, end_deg)]
-    for start, end in spans:
-        ax.axvspan(np.radians(start), np.radians(end), color="0.82", alpha=0.35, zorder=0)
-
-
-def _scatter_style(color: str, status: str, marker: str, paired_methods: bool) -> dict:
-    if status == "wrong":
-        if not paired_methods:
-            return {"s": 52, "marker": "x", "color": color, "alpha": 0.9, "linewidths": 1.5, "zorder": 4}
-        return {
-            "s": 48,
-            "marker": marker,
-            "facecolors": "none",
-            "edgecolors": color,
-            "alpha": 0.95,
-            "linewidths": 1.5,
-            "zorder": 4,
-        }
-    if status == "unclassified":
-        return {
-            "s": 34,
-            "marker": marker,
-            "facecolors": "none",
-            "edgecolors": color,
-            "alpha": 0.45,
-            "linewidths": 1.0,
-            "zorder": 3,
-        }
-    return {"s": 34, "marker": marker, "color": color, "alpha": 0.78, "zorder": 3}
-
-
-def _add_boss_count_legend(
-    ax,
-    estimates: Sequence[TrialEstimate],
-    class_colors: dict[str, str],
-    positive_name: str,
-    negative_name: str,
-    causal_estimation: bool,
-) -> None:
-    for class_name in (positive_name, negative_name):
-        noncausal_counts = boss_class_counts(estimates, class_name, method="noncausal")
-        label = (
-            f"BOSS {class_name}: n={noncausal_counts['n_boss']}, "
-            f"non-causal correct={noncausal_counts['n_correct']}"
-        )
-        if causal_estimation:
-            causal_counts = boss_class_counts(estimates, class_name, method="causal")
-            label = f"{label}, causal correct={causal_counts['n_correct']}"
-        ax.scatter(
-            [],
-            [],
-            s=32,
-            marker="o",
-            color=class_colors[class_name],
-            label=label,
-        )
-
-
-def _add_method_marker_legend(ax, causal_estimation: bool) -> None:
-    ax.scatter([], [], s=32, marker="o", color="0.25", label="non-causal phase")
-    if causal_estimation:
-        ax.scatter([], [], s=36, marker="^", color="0.25", label="causal AR phase")
-
+# ---- Static figures (notebook + publication export) ---------------------
 
 def plot_trial_signal(
     estimate: TrialEstimate,
     cutoff_ms: float,
     band: tuple[float, float],
     window_ms: tuple[float, float] | None = None,
+    ax=None,
 ):
-    """Plot raw signal plus non-causal and optional causal estimates for a clicked point."""
+    """Raw signal, non-causal filtered trace and (if available) causal AR core + forecast."""
     times_ms = estimate.times_ms
-    raw = estimate.raw
-    filtered = estimate.filtered
-
-    if window_ms is None:
-        plot_mask = np.ones_like(times_ms, dtype=bool)
-    else:
-        plot_mask = (times_ms >= window_ms[0]) & (times_ms <= window_ms[1])
-
-    fig, ax = plt.subplots(figsize=(10, 4.5))
-    ax.plot(times_ms[plot_mask], raw[plot_mask], color="black", lw=0.85, label=f"raw ({estimate.channel})")
+    plot_mask = _time_window_mask(times_ms, window_ms)
+    fig, ax = _figure_axes(ax, figsize=(10, 4.5))
+    ax.plot(times_ms[plot_mask], estimate.raw[plot_mask], color=METHOD_COLORS["raw"], lw=0.85,
+            label=f"raw ({estimate.channel})")
     ax.plot(
         times_ms[plot_mask],
-        filtered[plot_mask],
-        color="tab:blue",
+        estimate.filtered[plot_mask],
+        color=METHOD_COLORS["noncausal"],
         lw=1.35,
-        alpha=0.85,
         label=f"non-causal filtered ({band[0]:.0f}-{band[1]:.0f} Hz)",
     )
 
-    if estimate.causal_core is not None and estimate.causal_core_times_ms is not None:
-        core_mask = _time_window_mask(estimate.causal_core_times_ms, window_ms)
-        ax.plot(
-            estimate.causal_core_times_ms[core_mask],
-            estimate.causal_core[core_mask],
-            color="tab:red",
-            lw=1.2,
-            alpha=0.9,
-            label="causal AR core",
-        )
-    if estimate.causal_pred_future is not None and estimate.causal_future_times_ms is not None:
-        future_mask = _time_window_mask(estimate.causal_future_times_ms, window_ms)
-        ax.plot(
-            estimate.causal_future_times_ms[future_mask],
-            estimate.causal_pred_future[future_mask],
-            color="tab:red",
-            lw=1.2,
-            ls="--",
-            alpha=0.9,
-            label="causal AR predicted",
-        )
+    causal = estimate.causal
+    if causal is not None:
+        core_mask = _time_window_mask(causal.core_times_ms, window_ms)
+        ax.plot(causal.core_times_ms[core_mask], causal.core[core_mask], color=METHOD_COLORS["causal"],
+                lw=1.2, label="causal AR core")
+        future_mask = _time_window_mask(causal.future_times_ms, window_ms)
+        ax.plot(causal.future_times_ms[future_mask], causal.pred_future[future_mask], color=METHOD_COLORS["causal"],
+                lw=1.2, ls="--", label="causal AR predicted")
 
     ax.axvline(cutoff_ms, color="gray", ls=":", lw=1.2)
-    ax.plot([], [], " ", label=f"BOSS: {estimate.condition}")
-    ax.plot([], [], " ", label=f"non-causal: {estimate.noncausal_class}, {estimate.phase_deg:.1f} deg")
-    if estimate.causal_phase_deg is not None:
-        ax.plot([], [], " ", label=f"causal: {estimate.causal_class}, {estimate.causal_phase_deg:.1f} deg")
-    if estimate.causal_phase_error_deg is not None:
-        ax.plot([], [], " ", label=f"causal - non-causal: {estimate.causal_phase_error_deg:+.1f} deg")
+    ax.plot([], [], " ", label=f"BOSS: {estimate.label}")
+    ax.plot([], [], " ", label=f"non-causal: {estimate.phase_deg:.1f} deg")
+    if causal is not None:
+        ax.plot([], [], " ", label=f"causal: {causal.phase_deg:.1f} deg")
+        ax.plot([], [], " ", label=f"causal - non-causal: {causal.phase_error_deg:+.1f} deg")
     ax.set_title(f"{estimate.subject} trial {estimate.epoch_index + 1}")
     ax.set_xlabel("Time (ms)")
     ax.set_ylabel("Amplitude")
     ax.legend(loc="upper left", fontsize=8)
     fig.tight_layout()
     return fig
+
+
+def plot_phase_circle(
+    phases_deg: Sequence[float | None],
+    boss_labels: Sequence[str],
+    tolerance_deg: float,
+    title: str = "",
+    labels: LabelScheme = DEFAULT_LABELS,
+    ax=None,
+):
+    """Static polar plot: one dot per epoch at its phase, colored by BOSS label; shaded +/-T windows."""
+    fig, ax = _figure_axes(ax, figsize=(5.5, 5.5), subplot_kw={"projection": "polar"})
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+    ax.set_yticklabels([])
+    ax.set_title(title)
+    for center in (0.0, 180.0):
+        start, end = (center - tolerance_deg) % 360.0, (center + tolerance_deg) % 360.0
+        spans = [(start, 360.0), (0.0, end)] if start > end else [(start, end)]
+        for a, b in spans:
+            ax.axvspan(np.radians(a), np.radians(b), color="0.85", alpha=0.6, zorder=0)
+        ax.axvline(np.radians(center), color="black", ls=":", lw=1, alpha=0.55)
+    for class_name in labels.class_order:
+        selected = [p for p, b in zip(phases_deg, boss_labels) if b == class_name and p is not None]
+        if selected:
+            radius = np.linspace(1, 2, len(selected))
+            ax.scatter(np.radians(selected), radius, s=26, color=CLASS_COLORS.get(class_name, "0.5"),
+                       alpha=0.85, label=f"BOSS {class_name} (n={len(selected)})")
+    ax.set_ylim(0, 2.1)
+    ax.legend(loc="upper right", bbox_to_anchor=(1.35, 1.12), fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
+def plot_deviation_histogram(
+    histogram: dict,
+    tolerance_deg: float,
+    title: str = "",
+    xlabel: str = "Deviation (deg)",
+    labels: LabelScheme = DEFAULT_LABELS,
+    ax=None,
+):
+    """Stacked-by-class histogram from ``deviation_histogram`` / ``analyze_phase_results``."""
+    fig, ax = _figure_axes(ax, figsize=(7, 3.8))
+    edges = np.asarray(histogram["bin_edges_deg"])
+    width = edges[1] - edges[0]
+    bottom = np.zeros(len(edges) - 1)
+    ax.axvspan(-tolerance_deg, tolerance_deg, color="0.9", zorder=0, label=f"+/-{tolerance_deg:g} deg")
+    for class_name in labels.class_order:
+        counts = np.asarray(histogram["counts_by_class"].get(class_name, []))
+        if counts.sum() == 0:
+            continue
+        ax.bar(edges[:-1], counts, width=width, bottom=bottom, align="edge",
+               color=CLASS_COLORS.get(class_name, "0.5"), edgecolor="white", lw=0.5, label=f"BOSS {class_name}")
+        bottom += counts
+    ax.axvline(0, color="black", ls="--", lw=1)
+    stats = histogram.get("stats")
+    if stats and stats["n"]:
+        within = stats["pct_within"].get(str(tolerance_deg))
+        text = f"n={stats['n']}  mean={stats['mean_deg']:+.1f} deg  circ SD={stats['sd_deg']:.1f} deg  R={stats['R']:.2f}"
+        if within is not None:
+            text += f"  within +/-{tolerance_deg:g}: {within:.0f}%"
+        ax.set_title(f"{title}\n{text}" if title else text, fontsize=9)
+    ax.set_xlim(-180, 180)
+    ax.set_xticks(np.arange(-180, 181, 45))
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Epochs")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
+def plot_success_vs_tolerance(success: dict, ax=None, jitter: float = 0.09):
+    """% BOSS success vs tolerance: one dot per subject, paired lines, mean +/- SD, chance line.
+
+    ``success`` is the output of ``boss_success_by_tolerance`` (tolerances plotted in
+    the given order). Jitter is deterministic so the figure is reproducible.
+    """
+    fig, ax = _figure_axes(ax, figsize=(4.6, 4.4))
+    tolerances = success["tolerances_deg"]
+    n_subjects = len(success["subjects"])
+    offsets = np.linspace(-jitter, jitter, n_subjects) if n_subjects > 1 else np.zeros(1)
+    xs = np.arange(len(tolerances))
+    by_tol = [success["by_tolerance"][str(t)] for t in tolerances]
+
+    for s in range(n_subjects):
+        ys = [entry["success_pct"][s] for entry in by_tol]
+        ax.plot(xs + offsets[s], ys, color="0.75", lw=0.7, zorder=1)
+        ax.scatter(xs + offsets[s], ys, s=22, color=METHOD_COLORS["noncausal"], alpha=0.75, zorder=2,
+                   edgecolors="white", linewidths=0.5)
+    for x, entry in zip(xs, by_tol):
+        if entry["mean_pct"] is not None:
+            ax.hlines(entry["mean_pct"], x - 0.28, x + 0.28, color="black", lw=2.2, zorder=3)
+        if entry["sd_pct"] is not None:
+            ax.errorbar(x + 0.33, entry["mean_pct"], yerr=entry["sd_pct"], color="black", capsize=4, lw=1.3, zorder=3)
+        ax.hlines(entry["chance_pct"], x - 0.4, x + 0.4, color=METHOD_COLORS["causal"], ls="--", lw=1.3, zorder=0)
+    ax.plot([], [], color=METHOD_COLORS["causal"], ls="--", label="chance (2T/360)")
+    ax.plot([], [], color="black", lw=2.2, label="mean +/- SD")
+    ax.set_xticks(xs)
+    ax.set_xticklabels([f"+/-{t:g}" for t in tolerances])
+    ax.set_xlim(-0.6, len(tolerances) - 0.4)
+    ax.set_ylim(0, 100)
+    ax.set_xlabel("Tolerance (deg)")
+    ax.set_ylabel("BOSS success (% of labeled trials)")
+    ax.set_title(f"BOSS phase accuracy (non-causal, n={n_subjects} subjects)", fontsize=10)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(fontsize=8, loc="upper right", frameon=False)
+    fig.tight_layout()
+    return fig
+
+
+def _figure_axes(ax, figsize, subplot_kw=None):
+    if ax is not None:
+        return ax.figure, ax
+    return plt.subplots(figsize=figsize, subplot_kw=subplot_kw)
 
 
 def _time_window_mask(times_ms: np.ndarray, window_ms: tuple[float, float] | None) -> np.ndarray:

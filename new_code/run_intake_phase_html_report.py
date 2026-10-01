@@ -1,8 +1,10 @@
 """Export an interactive intake phase/BOSS HTML report.
 
 The expensive EEG loading, non-causal phase estimation, and optional causal
-optimization run once and are saved to JSON. The HTML report embeds that cached
-payload, so visual/layout edits can be made without touching the EEG data again.
+optimization run once and are saved to JSON. Everything derived from the phases
+(classes per tolerance, BOSS success, deviation histograms) is computed by
+``functions.analyze_phase_results`` each time the HTML is built, so analysis and
+visual edits never require touching the EEG data again.
 
 Run from the project root:
 
@@ -10,13 +12,13 @@ Run from the project root:
 
 Useful local workflows:
 
-    # Rebuild only the HTML from an existing cache.
+    # Rebuild only the HTML (and figures) from an existing cache.
     ./.venv/bin/python new_code/run_intake_phase_html_report.py --from-cache
 
     # Force a new calculation/cache.
     ./.venv/bin/python new_code/run_intake_phase_html_report.py --force
 
-    # Fast no-data smoke/demo report.
+    # Fast no-data report from synthetic epochs run through the real pipeline.
     ./.venv/bin/python new_code/run_intake_phase_html_report.py --demo --output-dir /tmp/intake_phase_report_demo
 """
 
@@ -50,26 +52,34 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ.setdefault("MPLCONFIGDIR", str(MPL_CONFIG_DIR))
 os.environ.setdefault("XDG_CACHE_HOME", str(XDG_CACHE_DIR))
 
-import run_intake_phase_viewer as settings
-from functions import TrialEstimate, estimate_all_subjects, load_intake_subjects
+import matplotlib.pyplot as plt
+
+import settings
+from functions import (
+    CLASS_COLORS,
+    METHOD_COLORS,
+    TrialEstimate,
+    analyze_phase_results,
+    estimate_all_subjects,
+    get_data,
+    make_synthetic_epochs,
+    plot_success_vs_tolerance,
+    resolve_noncausal_filter_order,
+)
 
 
 REPORT_DIR = Path("new_code/intake_phase_report")
 CACHE_FILENAME = "intake_phase_results.json"
 HTML_FILENAME = "intake_phase_report.html"
-TOLERANCE_OPTIONS_DEG = [15, 30, 45]
-DEFAULT_TOLERANCE_DEG = 30
+SUCCESS_FIGURE_STEM = "success_vs_tolerance"
+HISTOGRAM_BIN_WIDTH_DEG = 10.0
 MAX_SIGNAL_POINTS = 4000
 FLOAT_DECIMALS = 6
 SIGNAL_SCALE = 1_000_000.0
 SIGNAL_DECIMALS = 4
 SIGNAL_UNIT = "uV"
-
-CLASS_HEX_COLORS = {
-    settings.POSITIVE_NAME: "#2f8f5b",
-    settings.NEGATIVE_NAME: "#c7564c",
-    settings.UNKNOWN_NAME: "#858b93",
-}
+DEMO_SUBJECTS = 6
+DEMO_EPOCHS = 30
 
 
 def main() -> None:
@@ -92,10 +102,14 @@ def main() -> None:
         save_json(cache_path, payload)
         cache_written = True
 
-    write_html_report(html_path, payload)
+    report = prepare_report(payload)
+    write_html_report(html_path, report)
+    figure_paths = write_success_figure(output_dir, report)
     cache_label = "Wrote cache" if cache_written else "Used cache"
     print(f"{cache_label}: {cache_path}")
     print(f"Wrote HTML:  {html_path}")
+    for path in figure_paths:
+        print(f"Wrote figure: {path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,7 +118,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=REPORT_DIR,
-        help=f"Folder for {CACHE_FILENAME} and {HTML_FILENAME}.",
+        help=f"Folder for {CACHE_FILENAME}, {HTML_FILENAME} and the exported figures.",
     )
     parser.add_argument(
         "--from-cache",
@@ -125,19 +139,19 @@ def parse_args() -> argparse.Namespace:
         "--subjects",
         nargs="+",
         default=None,
-        help="Optional subject list. Defaults to SUBJECTS in run_intake_phase_viewer.py.",
+        help="Optional subject list. Defaults to SUBJECTS in settings.py.",
     )
     parser.add_argument(
         "--n-trials",
         type=int,
         default=None,
-        help="Optional trial cap for fast local smoke runs. Defaults to N_TRIALS in the runner.",
+        help="Optional epoch cap per subject for fast local smoke runs. Defaults to N_TRIALS in settings.py.",
     )
     parser.add_argument(
         "--n-opt-trials",
         type=int,
         default=None,
-        help="Optional Optuna trial cap. Defaults to OPT_N_TRIALS in the runner.",
+        help="Optional Optuna trial (parameter-set) cap. Defaults to OPT_N_TRIALS in settings.py.",
     )
     return parser.parse_args()
 
@@ -150,27 +164,7 @@ def compute_payload(args: argparse.Namespace) -> dict[str, Any]:
         optimization_config["n_opt_trials"] = args.n_opt_trials
 
     print(f"Loading subjects: {subjects}")
-    subject_data = load_intake_subjects(
-        subjects,
-        data_root=settings.DATA_ROOT,
-        intake_filename=settings.INTAKE_FILENAME,
-        channel=settings.CHANNEL,
-        condition_column=settings.CONDITION_COLUMN,
-        lowpass_before_downsample_hz=settings.LOWPASS_BEFORE_DOWNSAMPLE_HZ,
-        downsample=settings.DOWNSAMPLE,
-        downsample_fs=settings.DOWNSAMPLE_FS,
-        show_metadata_summary=settings.SHOW_METADATA_SUMMARY,
-        metadata_max_values=settings.METADATA_MAX_VALUES,
-        hjorth_channel=settings.HJORTH_CHANNEL,
-        hjorth_weights=settings.HJORTH_WEIGHTS,
-        hjorth_scale_reference=settings.HJORTH_SCALE_REFERENCE,
-        positive_labels=settings.POSITIVE_LABELS,
-        negative_labels=settings.NEGATIVE_LABELS,
-        positive_name=settings.POSITIVE_NAME,
-        negative_name=settings.NEGATIVE_NAME,
-        unknown_name=settings.UNKNOWN_NAME,
-        condition_auto_keywords=settings.CONDITION_AUTO_KEYWORDS,
-    )
+    subject_data = [get_data(subject, settings.LOAD_CONFIG) for subject in subjects]
 
     print("Estimating phase and causal parameters...")
     estimates_by_subject = estimate_all_subjects(
@@ -179,28 +173,26 @@ def compute_payload(args: argparse.Namespace) -> dict[str, Any]:
         filter_order=settings.FILTER_ORDER,
         cutoff_ms=settings.CUTOFF_MS,
         n_trials=n_trials,
-        phase_class_tolerance_deg=settings.PHASE_CLASS_TOLERANCE_DEG,
-        positive_name=settings.POSITIVE_NAME,
-        negative_name=settings.NEGATIVE_NAME,
-        unclassified_name=settings.NONCAUSAL_UNCLASSIFIED_NAME,
         causal_estimation=settings.CAUSAL_ESTIMATION,
         causal_params_mode=settings.CAUSAL_PARAMS_MODE,
         manual_causal_params=settings.MANUAL_CAUSAL_PARAMS,
         optimization_config=optimization_config,
     )
-
-    payload = estimates_to_payload(
+    return estimates_to_payload(
         estimates_by_subject,
         n_trials=n_trials,
         optimization_config=optimization_config,
+        causal_params_mode=settings.CAUSAL_PARAMS_MODE,
+        data_root=str(settings.DATA_ROOT),
     )
-    return payload
 
 
 def estimates_to_payload(
     estimates_by_subject: dict[str, list[TrialEstimate]],
     n_trials: int | bool,
     optimization_config: dict[str, Any],
+    causal_params_mode: str,
+    data_root: str,
 ) -> dict[str, Any]:
     subject_payloads = []
     total_trials = 0
@@ -218,6 +210,7 @@ def estimates_to_payload(
                 "channel": estimates[0].channel if estimates else settings.CHANNEL,
                 "causal_available": subject_causal_available,
                 "causal_params": first_causal_params(estimates),
+                "noncausal_filter_order": estimates[0].noncausal_filter_order if estimates else None,
                 "trials": trials,
             }
         )
@@ -227,7 +220,7 @@ def estimates_to_payload(
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "settings": {
             "subjects": list(estimates_by_subject.keys()),
-            "data_root": str(settings.DATA_ROOT),
+            "data_root": data_root,
             "intake_filename": settings.INTAKE_FILENAME,
             "channel": settings.CHANNEL,
             "band_hz": list(settings.BAND),
@@ -235,7 +228,7 @@ def estimates_to_payload(
             "cutoff_ms": settings.CUTOFF_MS,
             "n_trials": n_trials,
             "causal_estimation": settings.CAUSAL_ESTIMATION,
-            "causal_params_mode": settings.CAUSAL_PARAMS_MODE,
+            "causal_params_mode": causal_params_mode,
             "optimization_config": json_safe(optimization_config),
             "downsample": settings.DOWNSAMPLE,
             "downsample_fs": settings.DOWNSAMPLE_FS,
@@ -246,15 +239,12 @@ def estimates_to_payload(
             "signal_scale": SIGNAL_SCALE,
         },
         "class_names": {
-            "positive": settings.POSITIVE_NAME,
-            "negative": settings.NEGATIVE_NAME,
-            "unknown": settings.UNKNOWN_NAME,
-            "unclassified": settings.NONCAUSAL_UNCLASSIFIED_NAME,
+            "positive": settings.LABELS.positive,
+            "negative": settings.LABELS.negative,
+            "unknown": settings.LABELS.unknown,
+            "unclassified": settings.LABELS.unclassified,
         },
-        "class_order": list(settings.CLASS_ORDER),
-        "class_colors": CLASS_HEX_COLORS,
-        "tolerance_options_deg": TOLERANCE_OPTIONS_DEG,
-        "default_tolerance_deg": DEFAULT_TOLERANCE_DEG,
+        "class_order": list(settings.LABELS.class_order),
         "max_signal_points": MAX_SIGNAL_POINTS,
         "causal_available": causal_available,
         "total_trials": total_trials,
@@ -264,34 +254,77 @@ def estimates_to_payload(
 
 def trial_to_payload(est: TrialEstimate) -> dict[str, Any]:
     signal_idx = decimation_indices(len(est.times_ms), MAX_SIGNAL_POINTS)
-    payload = {
+    causal = est.causal
+    return {
         "trial_id": f"{est.subject}:{est.epoch_index}",
         "subject": est.subject,
         "epoch_index": est.epoch_index,
-        "boss_class": est.condition,
+        "boss_class": est.label,
         "phase_deg": round_float(est.phase_deg),
         "phase_rad": round_float(est.phase_rad),
         "amplitude": round_float(est.amplitude),
-        "causal_phase_deg": round_float(est.causal_phase_deg),
-        "causal_phase_rad": round_float(est.causal_phase_rad),
-        "causal_amplitude": round_float(est.causal_amplitude),
-        "causal_phase_error_deg": round_float(est.causal_phase_error_deg),
+        "causal_phase_deg": None if causal is None else round_float(causal.phase_deg),
+        "causal_phase_rad": None if causal is None else round_float(causal.phase_rad),
+        "causal_amplitude": None if causal is None else round_float(causal.amplitude),
+        "causal_phase_error_deg": None if causal is None else round_float(causal.phase_error_deg),
         "signal": {
             "t": round_array(est.times_ms[signal_idx]),
             "raw": signal_array(est.raw[signal_idx]),
             "filtered": signal_array(est.filtered[signal_idx]),
         },
-        "causal_core": trace_payload(est.causal_core_times_ms, est.causal_core),
-        "causal_future": trace_payload(est.causal_future_times_ms, est.causal_pred_future),
+        "causal_core": None if causal is None else trace_payload(causal.core_times_ms, causal.core),
+        "causal_future": None if causal is None else trace_payload(causal.future_times_ms, causal.pred_future),
     }
-    return payload
 
 
 def first_causal_params(estimates: Sequence[TrialEstimate]) -> dict[str, Any] | None:
     for est in estimates:
-        if est.causal_params is not None:
-            return json_safe(est.causal_params)
+        if est.causal is not None:
+            return json_safe(est.causal.params)
     return None
+
+
+def prepare_report(payload: dict[str, Any]) -> dict[str, Any]:
+    """Attach the current analysis, colors and tolerances to a (possibly old) cached payload."""
+    report = dict(payload)
+    run_settings = report["settings"]
+    subjects = []
+    for subject in report["subjects"]:
+        subject = dict(subject)
+        if subject.get("noncausal_filter_order") is None:
+            causal_params = subject.get("causal_params") if run_settings.get("causal_estimation") else None
+            subject["noncausal_filter_order"] = resolve_noncausal_filter_order(causal_params, run_settings["filter_order"])
+        subjects.append(subject)
+    report["subjects"] = subjects
+
+    report["class_colors"] = CLASS_COLORS
+    report["method_colors"] = METHOD_COLORS
+    report["tolerance_options_deg"] = sorted(settings.TOLERANCES_DEG)
+    report["default_tolerance_deg"] = settings.DEFAULT_TOLERANCE_DEG
+    report["analysis"] = json_safe(analyze_phase_results(
+        {
+            subject["id"]: {
+                "boss": [trial["boss_class"] for trial in subject["trials"]],
+                "noncausal_deg": [trial["phase_deg"] for trial in subject["trials"]],
+                "causal_deg": [trial["causal_phase_deg"] for trial in subject["trials"]],
+                "causal_error_deg": [trial["causal_phase_error_deg"] for trial in subject["trials"]],
+            }
+            for subject in subjects
+        },
+        tolerances_deg=list(settings.TOLERANCES_DEG),
+        bin_width_deg=HISTOGRAM_BIN_WIDTH_DEG,
+        labels=settings.LABELS,
+    ))
+    return report
+
+
+def write_success_figure(output_dir: Path, report: dict[str, Any]) -> list[Path]:
+    fig = plot_success_vs_tolerance(report["analysis"]["success"])
+    paths = [output_dir / f"{SUCCESS_FIGURE_STEM}.pdf", output_dir / f"{SUCCESS_FIGURE_STEM}.png"]
+    for path in paths:
+        fig.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return paths
 
 
 def trace_payload(times: np.ndarray | None, values: np.ndarray | None) -> dict[str, list[float | None]] | None:
@@ -336,12 +369,12 @@ def json_safe(value: Any) -> Any:
         return [json_safe(v) for v in value]
     if isinstance(value, np.ndarray):
         return [json_safe(v) for v in value.tolist()]
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
     if isinstance(value, (np.integer, int)):
         return int(value)
     if isinstance(value, (np.floating, float)):
         return round_float(value)
-    if isinstance(value, (np.bool_, bool)):
-        return bool(value)
     if value is None or isinstance(value, str):
         return value
     return str(value)
@@ -358,118 +391,42 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def make_demo_payload() -> dict[str, Any]:
-    rng = np.random.default_rng(7)
-    times = np.linspace(-700, 450, 1151)
-    trials = []
-    conditions = [
-        settings.POSITIVE_NAME,
-        settings.NEGATIVE_NAME,
-        settings.POSITIVE_NAME,
-        settings.NEGATIVE_NAME,
-        settings.UNKNOWN_NAME,
+    """Synthetic epochs for several fake subjects, run through the real estimation pipeline."""
+    subject_data = [
+        make_synthetic_epochs(
+            subject=f"demo_sub_{i + 1:03d}",
+            n_epochs=DEMO_EPOCHS,
+            phase_jitter_deg=20.0 + 8.0 * i,
+            seed=7 + i,
+            labels=settings.LABELS,
+        )
+        for i in range(DEMO_SUBJECTS)
     ]
-    for i in range(28):
-        condition = conditions[i % len(conditions)]
-        target = 0.0 if condition == settings.POSITIVE_NAME else 180.0
-        if condition == settings.UNKNOWN_NAME:
-            target = rng.uniform(0, 360)
-        phase_deg = (target + rng.normal(0, 34)) % 360
-        causal_phase_deg = (phase_deg + rng.normal(0, 18)) % 360
-        phase_rad = math.radians(phase_deg)
-        raw = (
-            0.9 * np.sin(2 * np.pi * 6 * times / 1000 + phase_rad)
-            + 0.25 * np.sin(2 * np.pi * 14 * times / 1000)
-            + rng.normal(0, 0.12, size=times.shape)
-        ) * 8e-6
-        filtered = 0.9 * np.sin(2 * np.pi * 6 * times / 1000 + phase_rad) * 8e-6
-        core_mask = (times >= -450) & (times <= -40)
-        future_mask = (times > -40) & (times <= 130)
-        trial = {
-            "trial_id": f"demo_sub_001:{i}",
-            "subject": "demo_sub_001",
-            "epoch_index": i,
-            "boss_class": condition,
-            "phase_deg": round_float(phase_deg),
-            "phase_rad": round_float(math.radians(phase_deg)),
-            "amplitude": round_float(abs(rng.normal(1.0, 0.15))),
-            "causal_phase_deg": round_float(causal_phase_deg),
-            "causal_phase_rad": round_float(math.radians(causal_phase_deg)),
-            "causal_amplitude": round_float(abs(rng.normal(0.92, 0.15))),
-            "causal_phase_error_deg": round_float(((causal_phase_deg - phase_deg + 180) % 360) - 180),
-            "signal": {
-                "t": round_array(times),
-                "raw": signal_array(raw),
-                "filtered": signal_array(filtered),
-            },
-            "causal_core": {
-                "t": round_array(times[core_mask]),
-                "y": signal_array(filtered[core_mask] + rng.normal(0, 0.025e-6, size=core_mask.sum())),
-            },
-            "causal_future": {
-                "t": round_array(times[future_mask]),
-                "y": signal_array(filtered[future_mask] + rng.normal(0, 0.06e-6, size=future_mask.sum())),
-            },
-        }
-        trials.append(trial)
-
-    optimization_config = dict(settings.CAUSAL_OPTIMIZATION_CONFIG)
-    subject = {
-        "id": "demo_sub_001",
-        "n_trials": len(trials),
-        "channel": settings.CHANNEL,
-        "causal_available": True,
-        "causal_params": {
-            "window_ms": 510.0,
-            "filter_order": 220,
-            "edge": 65,
-            "ar_order": 38,
-            "hilbert_window": settings.HILBERT_WINDOW,
-            "offset": settings.OFFSET,
-        },
-        "trials": trials,
-    }
-    return {
-        "schema_version": 1,
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "settings": {
-            "subjects": ["demo_sub_001"],
-            "data_root": "synthetic demo",
-            "intake_filename": settings.INTAKE_FILENAME,
-            "channel": settings.CHANNEL,
-            "band_hz": list(settings.BAND),
-            "filter_order": settings.FILTER_ORDER,
-            "cutoff_ms": settings.CUTOFF_MS,
-            "n_trials": len(trials),
-            "causal_estimation": True,
-            "causal_params_mode": "demo",
-            "optimization_config": json_safe(optimization_config),
-            "downsample": settings.DOWNSAMPLE,
-            "downsample_fs": settings.DOWNSAMPLE_FS,
-            "lowpass_before_downsample_hz": settings.LOWPASS_BEFORE_DOWNSAMPLE_HZ,
-            "condition_column": settings.CONDITION_COLUMN,
-            "raw_trace_label": f"{settings.CHANNEL} raw",
-            "signal_unit": SIGNAL_UNIT,
-            "signal_scale": SIGNAL_SCALE,
-        },
-        "class_names": {
-            "positive": settings.POSITIVE_NAME,
-            "negative": settings.NEGATIVE_NAME,
-            "unknown": settings.UNKNOWN_NAME,
-            "unclassified": settings.NONCAUSAL_UNCLASSIFIED_NAME,
-        },
-        "class_order": list(settings.CLASS_ORDER),
-        "class_colors": CLASS_HEX_COLORS,
-        "tolerance_options_deg": TOLERANCE_OPTIONS_DEG,
-        "default_tolerance_deg": DEFAULT_TOLERANCE_DEG,
-        "max_signal_points": MAX_SIGNAL_POINTS,
-        "causal_available": True,
-        "total_trials": len(trials),
-        "subjects": [subject],
-    }
+    estimates_by_subject = estimate_all_subjects(
+        subject_data,
+        band=settings.BAND,
+        filter_order=settings.FILTER_ORDER,
+        cutoff_ms=settings.CUTOFF_MS,
+        n_trials=False,
+        causal_estimation=True,
+        causal_params_mode="manual",
+        manual_causal_params=settings.MANUAL_CAUSAL_PARAMS,
+        optimization_config=settings.CAUSAL_OPTIMIZATION_CONFIG,
+    )
+    payload = estimates_to_payload(
+        estimates_by_subject,
+        n_trials=False,
+        optimization_config=settings.CAUSAL_OPTIMIZATION_CONFIG,
+        causal_params_mode="manual",
+        data_root="synthetic demo",
+    )
+    payload["settings"]["causal_estimation"] = True
+    payload["settings"]["raw_trace_label"] = "synthetic raw"
+    return payload
 
 
-def write_html_report(path: Path, payload: dict[str, Any]) -> None:
-    data_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).replace("<", "\\u003c")
+def write_html_report(path: Path, report: dict[str, Any]) -> None:
+    data_json = json.dumps(report, separators=(",", ":"), ensure_ascii=True).replace("<", "\\u003c")
     html = HTML_TEMPLATE.replace("__REPORT_DATA__", data_json)
     path.write_text(html, encoding="utf-8")
 
@@ -488,12 +445,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       --line: #d9ddd4;
       --soft: #eef1eb;
       --panel: #ffffff;
-      --accent: #245f73;
+      --accent: #33363b;
       --accent-ink: #ffffff;
-      --positive: #2f8f5b;
-      --negative: #c7564c;
+      --positive: #EE3377;
+      --negative: #0077BB;
       --unknown: #858b93;
-      --warn: #9c6b19;
+      --causal: #EE7733;
     }
 
     * { box-sizing: border-box; }
@@ -715,13 +672,72 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
 
     .signal-section,
+    .deviation-section,
+    .success-section,
     .params-section {
       border-top: 1px solid var(--line);
       margin-top: 28px;
       padding-top: 22px;
     }
 
-    .signal-wrap {
+    .section-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .stats-line {
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .success-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 640px) minmax(260px, 1fr);
+      gap: 28px;
+      align-items: start;
+    }
+
+    .table-scroll {
+      overflow-x: auto;
+    }
+
+    .success-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .success-table th {
+      padding: 5px 8px 5px 0;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-weight: 650;
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    .success-table td {
+      padding: 5px 8px 5px 0;
+      white-space: nowrap;
+    }
+
+    .success-table tr.selected td {
+      font-weight: 720;
+    }
+
+    .success-table tr.summary-line td {
+      color: var(--ink);
+      font-weight: 650;
+    }
+
+    .signal-wrap,
+    .deviation-wrap,
+    .success-wrap {
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--panel);
@@ -810,6 +826,10 @@ HTML_TEMPLATE = r"""<!doctype html>
         border-left: 0;
         padding-left: 0;
       }
+
+      .success-layout {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
@@ -867,6 +887,48 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
     </section>
 
+    <section class="deviation-section">
+      <div class="signal-head">
+        <h2 id="deviationTitle">Phase deviation</h2>
+        <p class="subtle" id="deviationSubtitle"></p>
+      </div>
+      <div class="section-toolbar">
+        <div class="control">
+          Deviation
+          <span class="segmented" id="deviationKindButtons">
+            <button type="button" data-deviation-kind="boss_target">Phase − BOSS target</button>
+            <button type="button" data-deviation-kind="causal_error">Causal − non-causal</button>
+          </span>
+        </div>
+        <div class="control">
+          Scope
+          <span class="segmented" id="deviationScopeButtons">
+            <button type="button" data-deviation-scope="subject">This subject</button>
+            <button type="button" data-deviation-scope="pooled">All subjects</button>
+          </span>
+        </div>
+      </div>
+      <div class="deviation-wrap">
+        <svg id="deviationSvg" viewBox="0 0 1080 340" role="img" aria-label="Deviation histogram"></svg>
+      </div>
+      <p class="stats-line" id="deviationStats"></p>
+    </section>
+
+    <section class="success-section">
+      <div class="signal-head">
+        <h2>BOSS success vs tolerance</h2>
+        <p class="subtle" id="successSubtitle"></p>
+      </div>
+      <div class="success-layout">
+        <div class="success-wrap">
+          <svg id="successSvg" viewBox="0 0 640 440" role="img" aria-label="BOSS success versus tolerance"></svg>
+        </div>
+        <div class="table-scroll">
+          <table class="success-table" id="successTable"></table>
+        </div>
+      </div>
+    </section>
+
     <section class="params-section">
       <h2>Selected optimization params</h2>
       <div class="params-grid" id="paramsGrid"></div>
@@ -875,26 +937,37 @@ HTML_TEMPLATE = r"""<!doctype html>
 
   <script id="report-data" type="application/json">__REPORT_DATA__</script>
   <script>
+    // All analysis numbers (classes, statuses, counts, histograms, circular stats, success %)
+    // are precomputed in functions.py and embedded in report.analysis; this script only draws them.
     const report = JSON.parse(document.getElementById("report-data").textContent);
+    const analysis = report.analysis;
     const NS = "http://www.w3.org/2000/svg";
     const POS = report.class_names.positive;
     const NEG = report.class_names.negative;
     const UNKNOWN = report.class_names.unknown;
-    const UNCLASSIFIED = report.class_names.unclassified;
     const classOrder = report.class_order || [POS, NEG, UNKNOWN];
     const colors = report.class_colors || {};
+    const methodColors = report.method_colors || { raw: "#9a9e98", noncausal: "#33363b", causal: "#EE7733" };
+    const ACCENT = "#33363b";
     const state = {
       subjectId: report.subjects[0]?.id || "",
       tolerance: report.default_tolerance_deg || 30,
       phaseMode: "noncausal",
-      selectedTrialId: null
+      selectedTrialId: null,
+      deviationKind: "boss_target",
+      deviationScope: "subject"
     };
+    report.subjects.forEach(subject => subject.trials.forEach((trial, index) => { trial._index = index; }));
 
     const subjectSelect = document.getElementById("subjectSelect");
     const toleranceButtons = document.getElementById("toleranceButtons");
     const methodButtons = document.getElementById("methodButtons");
+    const deviationKindButtons = document.getElementById("deviationKindButtons");
+    const deviationScopeButtons = document.getElementById("deviationScopeButtons");
     const phaseSvg = document.getElementById("phaseSvg");
     const signalSvg = document.getElementById("signalSvg");
+    const deviationSvg = document.getElementById("deviationSvg");
+    const successSvg = document.getElementById("successSvg");
 
     function el(name, attrs = {}, text = null) {
       const node = document.createElementNS(NS, name);
@@ -915,8 +988,22 @@ HTML_TEMPLATE = r"""<!doctype html>
       }[ch]));
     }
 
+    function fmt(value, digits = 1, signed = false) {
+      if (value === null || value === undefined) return "n/a";
+      const text = value.toFixed(digits);
+      return signed && value >= 0 ? `+${text}` : text;
+    }
+
+    function tolKey() {
+      return String(state.tolerance);
+    }
+
     function currentSubject() {
       return report.subjects.find(subject => subject.id === state.subjectId) || report.subjects[0];
+    }
+
+    function currentAnalysis() {
+      return analysis.subjects[currentSubject()?.id] || null;
     }
 
     function currentTrials() {
@@ -952,26 +1039,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       return trial?.causal_phase_deg !== null && trial?.causal_phase_deg !== undefined;
     }
 
-    function angularDistance(a, b) {
-      return Math.abs(((a - b + 180) % 360 + 360) % 360 - 180);
-    }
-
-    function phaseClass(phaseDeg, tolerance) {
-      if (phaseDeg === null || phaseDeg === undefined) return null;
-      const positiveDistance = angularDistance(phaseDeg, 0);
-      const negativeDistance = angularDistance(phaseDeg, 180);
-      const isPositive = positiveDistance <= tolerance;
-      const isNegative = negativeDistance <= tolerance;
-      if (isPositive && isNegative) return positiveDistance <= negativeDistance ? POS : NEG;
-      if (isPositive) return POS;
-      if (isNegative) return NEG;
-      return UNCLASSIFIED;
-    }
-
     function methodClass(trial, method) {
-      if (method === "noncausal") return phaseClass(trial.phase_deg, state.tolerance);
-      if (method === "causal") return phaseClass(trial.causal_phase_deg, state.tolerance);
-      return null;
+      return currentAnalysis()?.classes[method][tolKey()][trial._index] ?? null;
     }
 
     function methodPhase(trial, method) {
@@ -979,10 +1048,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
 
     function comparisonStatus(trial, method) {
-      const cls = methodClass(trial, method);
-      if (![POS, NEG].includes(trial.boss_class)) return "unknown";
-      if (!cls || cls === UNCLASSIFIED) return "unclassified";
-      return cls === trial.boss_class ? "correct" : "wrong";
+      return currentAnalysis()?.status[method][tolKey()][trial._index] ?? "unknown";
     }
 
     function polarPoint(cx, cy, radius, phaseDeg) {
@@ -1033,8 +1099,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
 
     function drawToleranceWindow(svg, cx, cy, r0, r1, centerDeg, tolerance) {
-      let start = centerDeg - tolerance;
-      let end = centerDeg + tolerance;
+      const start = centerDeg - tolerance;
+      const end = centerDeg + tolerance;
       const spans = [];
       if (start < 0) {
         spans.push([360 + start, 360]);
@@ -1048,8 +1114,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       spans.forEach(([a, b]) => {
         svg.appendChild(el("path", {
           d: sectorPath(cx, cy, r0, r1, a, b),
-          fill: "#dfe5dc",
-          opacity: "0.78"
+          fill: "#e4e6e2",
+          opacity: "0.85"
         }));
       });
     }
@@ -1140,16 +1206,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (visibleMethods.length === 2) {
         trials.forEach(trial => {
           if (!hasCausal(trial)) return;
-          const radius = radiusFor(trial);
-          const d = circularConnectorPath(cx, cy, radius, trial.phase_deg, trial.causal_phase_deg);
+          const d = circularConnectorPath(cx, cy, radiusFor(trial), trial.phase_deg, trial.causal_phase_deg);
           if (d) {
-            phaseSvg.appendChild(el("path", {
-              d,
-              fill: "none",
-              stroke: "#7c8279",
-              "stroke-width": "1",
-              opacity: "0.34"
-            }));
+            phaseSvg.appendChild(el("path", { d, fill: "none", stroke: "#7c8279", "stroke-width": "1", opacity: "0.34" }));
           }
         });
       }
@@ -1166,11 +1225,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         }
       });
 
-      if (selected) {
-        const radius = radiusFor(selected);
-        drawSelectedPair(phaseSvg, selected, cx, cy, radius);
-      }
-
+      if (selected) drawSelectedPair(phaseSvg, selected, cx, cy, radiusFor(selected));
       drawPhaseLegend(phaseSvg, visibleMethods);
     }
 
@@ -1180,13 +1235,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         const [causalX, causalY] = polarPoint(cx, cy, radius, trial.causal_phase_deg);
         const d = circularConnectorPath(cx, cy, radius, trial.phase_deg, trial.causal_phase_deg);
         if (d) {
-          svg.appendChild(el("path", {
-            d,
-            fill: "none",
-            stroke: "#245f73",
-            "stroke-width": "2",
-            opacity: "0.72"
-          }));
+          svg.appendChild(el("path", { d, fill: "none", stroke: ACCENT, "stroke-width": "2", opacity: "0.72" }));
         }
         addPoint(svg, trial, "causal", causalX, causalY);
         svg.appendChild(el("circle", { cx: causalX, cy: causalY, r: "13", class: "selected-ring" }));
@@ -1204,60 +1253,47 @@ HTML_TEMPLATE = r"""<!doctype html>
         y += 23;
       });
       y += 14;
-      svg.appendChild(el("circle", { cx: x, cy: y, r: 6, fill: "#ffffff", stroke: "#555", "stroke-width": "1.5" }));
+      svg.appendChild(el("circle", { cx: x, cy: y, r: 6, fill: "#555", stroke: "#ffffff", "stroke-width": "1" }));
       svg.appendChild(el("text", { x: x + 16, y: y + 4, class: "legend-text" }, visibleMethods.includes("noncausal") ? "non-causal" : "selected non-causal"));
       y += 24;
-      svg.appendChild(el("path", { d: `M${x},${y - 8} L${x - 8},${y + 8} L${x + 8},${y + 8} Z`, fill: "#ffffff", stroke: "#555", "stroke-width": "1.5" }));
+      svg.appendChild(el("path", { d: `M${x},${y - 8} L${x - 8},${y + 8} L${x + 8},${y + 8} Z`, fill: "#555", stroke: "#ffffff", "stroke-width": "1" }));
       svg.appendChild(el("text", { x: x + 16, y: y + 5, class: "legend-text" }, visibleMethods.includes("causal") ? "causal" : "selected causal"));
       y += 29;
-      svg.appendChild(el("circle", { cx: x, cy: y, r: 6, fill: "#ffffff", stroke: "#9c6b19", "stroke-width": "2.2" }));
-      svg.appendChild(el("text", { x: x + 16, y: y + 4, class: "legend-text" }, "BOSS mismatch"));
-    }
-
-    function countSummary(method) {
-      const trials = currentTrials();
-      const comparable = trials.filter(trial => [POS, NEG].includes(trial.boss_class));
-      let correct = 0;
-      let wrong = 0;
-      let unclassified = 0;
-      comparable.forEach(trial => {
-        const status = comparisonStatus(trial, method);
-        if (status === "correct") correct += 1;
-        if (status === "wrong") wrong += 1;
-        if (status === "unclassified") unclassified += 1;
-      });
-      return { correct, wrong, unclassified, compared: comparable.length };
+      svg.appendChild(el("circle", { cx: x, cy: y, r: 6, fill: "#ffffff", stroke: "#555", "stroke-width": "2.2" }));
+      svg.appendChild(el("text", { x: x + 16, y: y + 4, class: "legend-text" }, "BOSS mismatch (hollow)"));
+      y += 24;
+      svg.appendChild(el("circle", { cx: x, cy: y, r: 6, fill: "#ffffff", stroke: "#555", "stroke-width": "1.4", opacity: "0.48" }));
+      svg.appendChild(el("text", { x: x + 16, y: y + 4, class: "legend-text" }, "unclassified (faint)"));
     }
 
     function renderSummary() {
       const grid = document.getElementById("summaryGrid");
       const totals = document.getElementById("methodTotals");
-      const trials = currentTrials();
+      const subjectAnalysis = currentAnalysis();
       const visibleMethods = phaseModeMethods();
-      const rows = [POS, NEG].map(name => {
-        const bossTrials = trials.filter(trial => trial.boss_class === name);
-        const noncausalSame = bossTrials.filter(trial => methodClass(trial, "noncausal") === name).length;
-        const causalSame = bossTrials.filter(trial => methodClass(trial, "causal") === name).length;
-        const pieces = [];
-        if (visibleMethods.includes("noncausal")) pieces.push(`Non-causal labels ${noncausalSame} as ${name}.`);
-        if (visibleMethods.includes("causal")) pieces.push(`Causal labels ${causalSame} as ${name}.`);
+      if (!subjectAnalysis) {
+        grid.innerHTML = "";
+        totals.innerHTML = "";
+        return;
+      }
+      const counts = method => subjectAnalysis.counts[method][tolKey()];
+      grid.innerHTML = [POS, NEG].map(name => {
+        const pieces = visibleMethods.map(method => `${methodLabel(method)} labels ${counts(method).by_class[name].correct} as ${name}.`);
         return `
           <div class="summary-row">
             <span class="color-bar" style="background:${htmlEscape(colors[name] || "#858b93")}"></span>
             <div>
-              <strong>BOSS ${htmlEscape(name)}: ${bossTrials.length}</strong>
+              <strong>BOSS ${htmlEscape(name)}: ${counts("noncausal").by_class[name].n}</strong>
               <p>${pieces.map(htmlEscape).join(" ")}</p>
             </div>
           </div>
         `;
       }).join("");
-      grid.innerHTML = rows;
 
-      const items = visibleMethods.map(method => {
-        const counts = countSummary(method);
-        return `<strong>${methodLabel(method)}</strong>: ${counts.correct}/${counts.compared} BOSS matches, ${counts.wrong} mismatches, ${counts.unclassified} unclassified at +/-${state.tolerance} deg.`;
-      });
-      totals.innerHTML = items.map(item => `<p>${item}</p>`).join("");
+      totals.innerHTML = visibleMethods.map(method => {
+        const c = counts(method);
+        return `<p><strong>${methodLabel(method)}</strong>: ${c.correct}/${c.n_labeled} BOSS matches (${fmt(c.success_pct, 1)}%), ${c.wrong} mismatches, ${c.unclassified} unclassified at +/-${state.tolerance} deg.</p>`;
+      }).join("");
     }
 
     function renderSignal() {
@@ -1271,8 +1307,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       state.selectedTrialId = trial.trial_id;
 
       document.getElementById("signalTitle").textContent = `${trial.subject} trial ${trial.epoch_index + 1}`;
-      const nonCls = methodClass(trial, "noncausal");
-      let meta = `BOSS ${trial.boss_class}; non-causal ${nonCls}, ${trial.phase_deg?.toFixed(1)} deg`;
+      let meta = `BOSS ${trial.boss_class}; non-causal ${methodClass(trial, "noncausal")}, ${trial.phase_deg?.toFixed(1)} deg`;
       if (hasCausal(trial)) {
         meta += `; causal ${methodClass(trial, "causal")}, ${trial.causal_phase_deg.toFixed(1)} deg`;
       }
@@ -1286,14 +1321,14 @@ HTML_TEMPLATE = r"""<!doctype html>
       const t = trial.signal.t;
       const channelLabel = report.settings.raw_trace_label || `${report.settings.channel || "channel"} raw`;
       const series = [
-        { name: channelLabel, t, y: trial.signal.raw, color: "#20211f", width: 1.05, opacity: 0.78 },
-        { name: "non-causal filtered", t, y: trial.signal.filtered, color: "#245f73", width: 1.8, opacity: 0.95 }
+        { name: channelLabel, t, y: trial.signal.raw, color: methodColors.raw, width: 1.05, opacity: 0.9 },
+        { name: "non-causal filtered", t, y: trial.signal.filtered, color: methodColors.noncausal, width: 1.8, opacity: 0.95 }
       ];
       if (trial.causal_core) {
-        series.push({ name: "causal AR core", t: trial.causal_core.t, y: trial.causal_core.y, color: "#c7564c", width: 1.55, opacity: 0.92 });
+        series.push({ name: "causal AR core", t: trial.causal_core.t, y: trial.causal_core.y, color: methodColors.causal, width: 1.55, opacity: 0.95 });
       }
       if (trial.causal_future) {
-        series.push({ name: "causal AR prediction", t: trial.causal_future.t, y: trial.causal_future.y, color: "#c7564c", width: 1.65, opacity: 0.86, dash: "5 5" });
+        series.push({ name: "causal AR prediction", t: trial.causal_future.t, y: trial.causal_future.y, color: methodColors.causal, width: 1.65, opacity: 0.9, dash: "5 5" });
       }
       const xMin = Math.min(...series.flatMap(s => s.t));
       const xMax = Math.max(...series.flatMap(s => s.t));
@@ -1313,39 +1348,18 @@ HTML_TEMPLATE = r"""<!doctype html>
 
       signalSvg.appendChild(el("rect", { x: 0, y: 0, width, height, fill: "#ffffff" }));
       if (trial.causal_future?.t?.length) {
-        const start = Math.min(...trial.causal_future.t);
-        const end = Math.max(...trial.causal_future.t);
-        const x1 = xScale(start);
-        const x2 = xScale(end);
-        signalSvg.appendChild(el("rect", {
-          x: x1,
-          y: margin.top,
-          width: Math.max(1, x2 - x1),
-          height: innerH,
-          fill: "#c7564c",
-          opacity: "0.09"
-        }));
-        signalSvg.appendChild(el("text", {
-          x: x1 + 8,
-          y: margin.top + 16,
-          class: "legend-text"
-        }, "AR prediction"));
+        const x1 = xScale(Math.min(...trial.causal_future.t));
+        const x2 = xScale(Math.max(...trial.causal_future.t));
+        signalSvg.appendChild(el("rect", { x: x1, y: margin.top, width: Math.max(1, x2 - x1), height: innerH, fill: methodColors.causal, opacity: "0.09" }));
+        signalSvg.appendChild(el("text", { x: x1 + 8, y: height - margin.bottom - 8, class: "legend-text" }, "AR prediction"));
       }
       for (let i = 0; i <= 4; i += 1) {
         const y = margin.top + (innerH / 4) * i;
         signalSvg.appendChild(el("line", { x1: margin.left, x2: width - margin.right, y1: y, y2: y, stroke: "#e2e6df", "stroke-width": "1" }));
       }
-      const verticalGridStart = Math.ceil(xMin / 200) * 200;
-      for (let value = verticalGridStart; value <= xMax + 0.001; value += 200) {
+      for (let value = Math.ceil(xMin / 200) * 200; value <= xMax + 0.001; value += 200) {
         const x = xScale(value);
-        signalSvg.appendChild(el("line", {
-          x1: x,
-          x2: x,
-          y1: margin.top,
-          y2: height - margin.bottom,
-          stroke: "#edf0ea",
-          "stroke-width": "1"
-        }));
+        signalSvg.appendChild(el("line", { x1: x, x2: x, y1: margin.top, y2: height - margin.bottom, stroke: "#edf0ea", "stroke-width": "1" }));
       }
       const zeroX = xScale(report.settings.cutoff_ms || 0);
       signalSvg.appendChild(el("line", { x1: zeroX, x2: zeroX, y1: margin.top, y2: height - margin.bottom, stroke: "#8b9189", "stroke-dasharray": "4 5", "stroke-width": "1.3" }));
@@ -1354,11 +1368,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       signalSvg.appendChild(el("line", { x1: margin.left, y1: margin.top, x2: margin.left, y2: height - margin.bottom, stroke: "#aeb6ab" }));
       [xMin, 0, xMax].forEach(value => {
         if (value < xMin || value > xMax) return;
-        const x = xScale(value);
-        signalSvg.appendChild(el("text", { x, y: height - 16, class: "axis-label", "text-anchor": "middle" }, `${Math.round(value)} ms`));
+        signalSvg.appendChild(el("text", { x: xScale(value), y: height - 16, class: "axis-label", "text-anchor": "middle" }, `${Math.round(value)} ms`));
       });
-      const unit = report.settings.signal_unit || "a.u.";
-      signalSvg.appendChild(el("text", { x: 18, y: 28, class: "axis-label" }, `Amplitude (${unit})`));
+      signalSvg.appendChild(el("text", { x: 18, y: 28, class: "axis-label" }, `Amplitude (${report.settings.signal_unit || "a.u."})`));
 
       series.forEach(s => {
         signalSvg.appendChild(el("path", {
@@ -1384,17 +1396,188 @@ HTML_TEMPLATE = r"""<!doctype html>
       });
     }
 
+    function niceStep(maxValue, targetTicks) {
+      const raw = Math.max(maxValue, 1) / targetTicks;
+      const power = 10 ** Math.floor(Math.log10(raw));
+      const unit = [1, 2, 5, 10].find(m => m * power >= raw) || 10;
+      return Math.max(1, unit * power);
+    }
+
+    function renderDeviation() {
+      const kind = state.deviationKind;
+      const pooled = state.deviationScope === "pooled";
+      const histogram = pooled ? analysis.pooled[kind] : currentAnalysis()?.deviations[kind];
+      const kindLabel = kind === "causal_error" ? "Causal − non-causal phase (deg)" : "Non-causal phase − BOSS target (deg)";
+      document.getElementById("deviationTitle").textContent = kind === "causal_error" ? "Causal estimator error" : "Phase deviation from BOSS target";
+      document.getElementById("deviationSubtitle").textContent = `${pooled ? "All subjects pooled" : currentSubject()?.id || ""}, 10 deg bins, +/-${state.tolerance} deg shaded`;
+      deviationSvg.replaceChildren();
+
+      const stats = histogram?.stats;
+      if (!histogram || !stats?.n) {
+        deviationSvg.appendChild(el("text", { x: 540, y: 170, class: "empty" }, "No deviations available"));
+        document.getElementById("deviationStats").textContent = "";
+        return;
+      }
+
+      const margin = { left: 64, right: 28, top: 24, bottom: 52 };
+      const width = 1080;
+      const height = 340;
+      const innerW = width - margin.left - margin.right;
+      const innerH = height - margin.top - margin.bottom;
+      const edges = histogram.bin_edges_deg;
+      const nBins = edges.length - 1;
+      const totals = Array.from({ length: nBins }, (_, i) => classOrder.reduce((sum, name) => sum + (histogram.counts_by_class[name]?.[i] || 0), 0));
+      const step = niceStep(Math.max(...totals), 5);
+      const yMax = Math.max(step, Math.ceil(Math.max(...totals) / step) * step);
+      const xScale = value => margin.left + ((value + 180) / 360) * innerW;
+      const yScale = value => margin.top + (1 - value / yMax) * innerH;
+
+      deviationSvg.appendChild(el("rect", { x: 0, y: 0, width, height, fill: "#ffffff" }));
+      deviationSvg.appendChild(el("rect", {
+        x: xScale(-state.tolerance), y: margin.top, width: xScale(state.tolerance) - xScale(-state.tolerance), height: innerH, fill: "#e4e6e2", opacity: "0.85"
+      }));
+      for (let value = 0; value <= yMax + 0.001; value += step) {
+        const y = yScale(value);
+        deviationSvg.appendChild(el("line", { x1: margin.left, x2: width - margin.right, y1: y, y2: y, stroke: "#edf0ea" }));
+        deviationSvg.appendChild(el("text", { x: margin.left - 10, y: y + 4, class: "axis-label", "text-anchor": "end" }, String(value)));
+      }
+
+      for (let i = 0; i < nBins; i += 1) {
+        let base = 0;
+        const x = xScale(edges[i]);
+        const barW = xScale(edges[i + 1]) - x;
+        classOrder.forEach(name => {
+          const count = histogram.counts_by_class[name]?.[i] || 0;
+          if (!count) return;
+          const rect = el("rect", {
+            x: x + 0.5, y: yScale(base + count), width: Math.max(0, barW - 1), height: yScale(base) - yScale(base + count),
+            fill: colors[name] || "#858b93", opacity: "0.9"
+          });
+          rect.appendChild(el("title", {}, `${edges[i]} to ${edges[i + 1]} deg | BOSS ${name}: ${count}`));
+          deviationSvg.appendChild(rect);
+          base += count;
+        });
+      }
+
+      const zeroX = xScale(0);
+      deviationSvg.appendChild(el("line", { x1: zeroX, x2: zeroX, y1: margin.top, y2: height - margin.bottom, stroke: "#20211f", "stroke-dasharray": "4 4", "stroke-width": "1.2" }));
+      deviationSvg.appendChild(el("line", { x1: margin.left, y1: height - margin.bottom, x2: width - margin.right, y2: height - margin.bottom, stroke: "#aeb6ab" }));
+      for (let value = -180; value <= 180; value += 45) {
+        deviationSvg.appendChild(el("text", { x: xScale(value), y: height - margin.bottom + 18, class: "axis-label", "text-anchor": "middle" }, String(value)));
+      }
+      deviationSvg.appendChild(el("text", { x: margin.left + innerW / 2, y: height - 10, class: "axis-label", "text-anchor": "middle" }, kindLabel));
+      deviationSvg.appendChild(el("text", { x: 18, y: 16, class: "axis-label" }, "Trials"));
+
+      let ly = margin.top + 6;
+      classOrder.forEach(name => {
+        if (!histogram.counts_by_class[name]?.some(v => v)) return;
+        deviationSvg.appendChild(el("rect", { x: width - margin.right - 130, y: ly, width: 12, height: 12, fill: colors[name] || "#858b93" }));
+        deviationSvg.appendChild(el("text", { x: width - margin.right - 112, y: ly + 10, class: "legend-text" }, `BOSS ${name}`));
+        ly += 20;
+      });
+
+      const within = stats.pct_within[tolKey()];
+      document.getElementById("deviationStats").textContent =
+        `n = ${stats.n} trials · circular mean (bias) ${fmt(stats.mean_deg, 1, true)} deg · circular SD ${fmt(stats.sd_deg, 1)} deg · resultant length R = ${fmt(stats.R, 3)} · within +/-${state.tolerance} deg: ${fmt(within, 1)}%`;
+    }
+
+    function renderSuccess() {
+      const success = analysis.success;
+      const tolerances = success.tolerances_deg;
+      const subjects = success.subjects;
+      const entries = tolerances.map(tol => success.by_tolerance[String(tol)]);
+      document.getElementById("successSubtitle").textContent =
+        `Non-causal phase within +/-T of the BOSS target, % of BOSS-labeled trials per subject (unclassified = failure). n = ${subjects.length} subjects; bar = mean, whiskers = ±1 SD; dashed = chance (2T/360).`;
+      successSvg.replaceChildren();
+
+      const margin = { left: 64, right: 24, top: 24, bottom: 58 };
+      const width = 640;
+      const height = 440;
+      const innerW = width - margin.left - margin.right;
+      const innerH = height - margin.top - margin.bottom;
+      const slot = innerW / tolerances.length;
+      const xCenter = i => margin.left + slot * (i + 0.5);
+      const yScale = value => margin.top + (1 - value / 100) * innerH;
+      const jitter = s => subjects.length > 1 ? (-0.13 + 0.26 * s / (subjects.length - 1)) * slot : 0;
+
+      successSvg.appendChild(el("rect", { x: 0, y: 0, width, height, fill: "#ffffff" }));
+      for (let value = 0; value <= 100; value += 20) {
+        const y = yScale(value);
+        successSvg.appendChild(el("line", { x1: margin.left, x2: width - margin.right, y1: y, y2: y, stroke: "#edf0ea" }));
+        successSvg.appendChild(el("text", { x: margin.left - 10, y: y + 4, class: "axis-label", "text-anchor": "end" }, `${value}%`));
+      }
+      successSvg.appendChild(el("line", { x1: margin.left, y1: height - margin.bottom, x2: width - margin.right, y2: height - margin.bottom, stroke: "#aeb6ab" }));
+
+      entries.forEach((entry, i) => {
+        const y = yScale(entry.chance_pct);
+        successSvg.appendChild(el("line", { x1: xCenter(i) - slot * 0.4, x2: xCenter(i) + slot * 0.4, y1: y, y2: y, stroke: methodColors.causal, "stroke-dasharray": "6 4", "stroke-width": "1.6" }));
+        successSvg.appendChild(el("text", { x: xCenter(i), y: height - margin.bottom + 20, class: "axis-label", "text-anchor": "middle" }, `±${tolerances[i]}°`));
+      });
+      successSvg.appendChild(el("text", { x: margin.left + innerW / 2, y: height - 12, class: "axis-label", "text-anchor": "middle" }, "Tolerance around BOSS target (deg)"));
+      successSvg.appendChild(el("text", { x: 14, y: 16, class: "axis-label" }, "BOSS success"));
+      const legendX = width - margin.right - 150;
+      successSvg.appendChild(el("line", { x1: legendX, x2: legendX + 24, y1: margin.top + 8, y2: margin.top + 8, stroke: methodColors.causal, "stroke-dasharray": "6 4", "stroke-width": "1.6" }));
+      successSvg.appendChild(el("text", { x: legendX + 32, y: margin.top + 12, class: "legend-text" }, "chance (2T/360)"));
+      successSvg.appendChild(el("line", { x1: legendX, x2: legendX + 24, y1: margin.top + 28, y2: margin.top + 28, stroke: "#20211f", "stroke-width": "3" }));
+      successSvg.appendChild(el("text", { x: legendX + 32, y: margin.top + 32, class: "legend-text" }, "mean ± SD"));
+
+      subjects.forEach((subjectId, s) => {
+        const points = entries.map((entry, i) => [xCenter(i) + jitter(s), entry.success_pct[s]]).filter(([, v]) => v !== null);
+        if (points.length > 1) {
+          successSvg.appendChild(el("path", { d: points.map(([x, v], k) => `${k ? "L" : "M"}${x.toFixed(2)},${yScale(v).toFixed(2)}`).join(""), fill: "none", stroke: "#c3c7c0", "stroke-width": "1" }));
+        }
+      });
+      entries.forEach((entry, i) => {
+        const x = xCenter(i);
+        if (entry.mean_pct !== null) {
+          if (entry.sd_pct !== null) {
+            const top = yScale(Math.min(100, entry.mean_pct + entry.sd_pct));
+            const bottom = yScale(Math.max(0, entry.mean_pct - entry.sd_pct));
+            successSvg.appendChild(el("line", { x1: x, x2: x, y1: top, y2: bottom, stroke: "#20211f", "stroke-width": "1.6" }));
+            [top, bottom].forEach(yy => successSvg.appendChild(el("line", { x1: x - 8, x2: x + 8, y1: yy, y2: yy, stroke: "#20211f", "stroke-width": "1.6" })));
+          }
+          const meanY = yScale(entry.mean_pct);
+          successSvg.appendChild(el("line", { x1: x - slot * 0.26, x2: x + slot * 0.26, y1: meanY, y2: meanY, stroke: "#20211f", "stroke-width": "3" }));
+        }
+        subjects.forEach((subjectId, s) => {
+          const value = entry.success_pct[s];
+          if (value === null) return;
+          const isSelected = subjectId === state.subjectId;
+          const dot = el("circle", {
+            cx: (x + jitter(s)).toFixed(2), cy: yScale(value).toFixed(2), r: isSelected ? 6 : 4.5,
+            fill: methodColors.noncausal, opacity: isSelected ? "1" : "0.7", stroke: isSelected ? "#ffffff" : "none", "stroke-width": "1.5"
+          });
+          dot.appendChild(el("title", {}, `${subjectId} | ±${tolerances[i]}°: ${entry.correct[s]}/${entry.n_labeled[s]} (${fmt(value, 1)}%)`));
+          successSvg.appendChild(dot);
+          if (isSelected) successSvg.appendChild(el("circle", { cx: (x + jitter(s)).toFixed(2), cy: yScale(value).toFixed(2), r: 10, class: "selected-ring" }));
+        });
+      });
+
+      const header = `<tr><th>Subject</th>${tolerances.map(t => `<th>±${t}°</th>`).join("")}</tr>`;
+      const rows = subjects.map((subjectId, s) => `
+        <tr class="${subjectId === state.subjectId ? "selected" : ""}">
+          <td>${htmlEscape(subjectId)}</td>
+          ${entries.map(entry => `<td>${entry.correct[s]}/${entry.n_labeled[s]} (${fmt(entry.success_pct[s], 0)}%)</td>`).join("")}
+        </tr>`).join("");
+      const meanRow = `<tr class="summary-line"><td>mean ± SD</td>${entries.map(entry => `<td>${fmt(entry.mean_pct, 1)} ± ${fmt(entry.sd_pct, 1)}%</td>`).join("")}</tr>`;
+      const chanceRow = `<tr class="summary-line"><td>chance</td>${entries.map(entry => `<td>${fmt(entry.chance_pct, 1)}%</td>`).join("")}</tr>`;
+      document.getElementById("successTable").innerHTML = `<thead>${header}</thead><tbody>${rows}${meanRow}${chanceRow}</tbody>`;
+    }
+
     function renderParams() {
       const paramsGrid = document.getElementById("paramsGrid");
       const subjectBlocks = report.subjects.map(subject => {
         const params = subject.causal_params;
-        const rows = params
-          ? Object.entries(params).map(([key, value]) => `<tr><td>${htmlEscape(key)}</td><td>${htmlEscape(value)}</td></tr>`).join("")
-          : `<tr><td>causal params</td><td>not available</td></tr>`;
+        const rows = [`<tr><td>non-causal filter_order (used)</td><td>${htmlEscape(subject.noncausal_filter_order)}</td></tr>`];
+        if (params) {
+          Object.entries(params).forEach(([key, value]) => rows.push(`<tr><td>${htmlEscape(key)}</td><td>${htmlEscape(value)}</td></tr>`));
+        } else {
+          rows.push(`<tr><td>causal params</td><td>not available</td></tr>`);
+        }
         return `
           <div class="params-block">
             <h3>${htmlEscape(subject.id)}</h3>
-            <table>${rows}</table>
+            <table>${rows.join("")}</table>
           </div>
         `;
       }).join("");
@@ -1402,6 +1585,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         ["band_hz", (report.settings.band_hz || []).join("-")],
         ["cutoff_ms", report.settings.cutoff_ms],
         ["channel", report.settings.channel],
+        ["default filter_order (used when not optimizing)", report.settings.filter_order],
         ["causal_params_mode", report.settings.causal_params_mode],
         ["n_opt_trials", report.settings.optimization_config?.n_opt_trials],
         ["train_fraction", report.settings.optimization_config?.train_fraction],
@@ -1416,6 +1600,15 @@ HTML_TEMPLATE = r"""<!doctype html>
       `;
     }
 
+    function setupSegmented(container, attribute, onSelect) {
+      container.addEventListener("click", event => {
+        const button = event.target.closest(`button[${attribute}]`);
+        if (!button || button.disabled) return;
+        onSelect(button.getAttribute(attribute));
+        renderAll();
+      });
+    }
+
     function setupControls() {
       subjectSelect.innerHTML = report.subjects.map(subject => `<option value="${htmlEscape(subject.id)}">${htmlEscape(subject.id)}</option>`).join("");
       subjectSelect.value = state.subjectId;
@@ -1428,47 +1621,42 @@ HTML_TEMPLATE = r"""<!doctype html>
       toleranceButtons.innerHTML = (report.tolerance_options_deg || [15, 30, 45]).map(value => (
         `<button type="button" data-tolerance="${value}">+/-${value}</button>`
       )).join("");
-      toleranceButtons.addEventListener("click", event => {
-        const button = event.target.closest("button[data-tolerance]");
-        if (!button) return;
-        state.tolerance = Number(button.dataset.tolerance);
-        renderAll();
-      });
+      setupSegmented(toleranceButtons, "data-tolerance", value => { state.tolerance = Number(value); });
 
       methodButtons.querySelectorAll("[data-phase-mode]").forEach(button => {
-        const mode = button.dataset.phaseMode;
-        if (!report.causal_available && mode !== "noncausal") button.disabled = true;
+        if (!report.causal_available && button.dataset.phaseMode !== "noncausal") button.disabled = true;
       });
-      methodButtons.addEventListener("click", event => {
-        const button = event.target.closest("button[data-phase-mode]");
-        if (!button || button.disabled) return;
-        state.phaseMode = button.dataset.phaseMode;
-        renderAll();
-      });
+      setupSegmented(methodButtons, "data-phase-mode", value => { state.phaseMode = value; });
 
-      phaseSvg.addEventListener("click", event => {
-        const target = event.target.closest("[data-trial-id]");
-        if (!target) return;
-        state.selectedTrialId = target.getAttribute("data-trial-id");
-        renderAll();
+      deviationKindButtons.querySelectorAll("[data-deviation-kind]").forEach(button => {
+        if (!report.causal_available && button.dataset.deviationKind === "causal_error") button.disabled = true;
       });
-      phaseSvg.addEventListener("keydown", event => {
-        if (event.key !== "Enter" && event.key !== " ") return;
+      setupSegmented(deviationKindButtons, "data-deviation-kind", value => { state.deviationKind = value; });
+      setupSegmented(deviationScopeButtons, "data-deviation-scope", value => { state.deviationScope = value; });
+
+      const selectTrial = event => {
         const target = event.target.closest("[data-trial-id]");
         if (!target) return;
         event.preventDefault();
         state.selectedTrialId = target.getAttribute("data-trial-id");
         renderAll();
+      };
+      phaseSvg.addEventListener("click", selectTrial);
+      phaseSvg.addEventListener("keydown", event => {
+        if (event.key === "Enter" || event.key === " ") selectTrial(event);
       });
     }
 
     function updateControlState() {
-      [...toleranceButtons.querySelectorAll("button")].forEach(button => {
-        button.classList.toggle("active", Number(button.dataset.tolerance) === state.tolerance);
-      });
-      [...methodButtons.querySelectorAll("button[data-phase-mode]")].forEach(button => {
-        button.classList.toggle("active", button.dataset.phaseMode === state.phaseMode);
-      });
+      const toggle = (container, attribute, value) => {
+        container.querySelectorAll(`button[${attribute}]`).forEach(button => {
+          button.classList.toggle("active", button.getAttribute(attribute) === String(value));
+        });
+      };
+      toggle(toleranceButtons, "data-tolerance", state.tolerance);
+      toggle(methodButtons, "data-phase-mode", state.phaseMode);
+      toggle(deviationKindButtons, "data-deviation-kind", state.deviationKind);
+      toggle(deviationScopeButtons, "data-deviation-scope", state.deviationScope);
     }
 
     function renderRunMeta() {
@@ -1484,6 +1672,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       renderPhase();
       renderSummary();
       renderSignal();
+      renderDeviation();
+      renderSuccess();
       renderParams();
     }
 
