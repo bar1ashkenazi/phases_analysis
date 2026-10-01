@@ -1150,58 +1150,87 @@ def plot_deviation_histogram(
     histogram: dict,
     tolerance_deg: float,
     title: str = "",
-    xlabel: str = "Deviation (deg)",
     labels: LabelScheme = DEFAULT_LABELS,
     ax=None,
 ):
-    """Stacked-by-class histogram from ``deviation_histogram`` / ``analyze_phase_results``."""
-    fig, ax = _figure_axes(ax, figsize=(7, 3.8))
+    """Circular (rose) histogram from ``deviation_histogram`` / ``analyze_phase_results``.
+
+    0 deg (no deviation) is at the top and positive deviations run clockwise. Wedges are
+    stacked by BOSS class, wedge length = epoch count. The shaded sector is +/-tolerance,
+    and the arrow is the mean resultant vector: its direction is the circular mean (bias),
+    its length is R (1 = all deviations identical) relative to the outer ring.
+    """
+    fig, ax = _figure_axes(ax, figsize=(5.2, 5.4), subplot_kw={"projection": "polar"})
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
     edges = np.asarray(histogram["bin_edges_deg"])
-    width = edges[1] - edges[0]
+    width = np.radians(edges[1] - edges[0])
+    totals = sum(np.asarray(c) for c in histogram["counts_by_class"].values())
+    r_max = max(float(np.max(totals)), 1.0) * 1.08
+
+    ax.bar(0.0, r_max, width=np.radians(2 * tolerance_deg), color="0.9", zorder=0,
+           label=f"+/-{tolerance_deg:g} deg")
     bottom = np.zeros(len(edges) - 1)
-    ax.axvspan(-tolerance_deg, tolerance_deg, color="0.9", zorder=0, label=f"+/-{tolerance_deg:g} deg")
     for class_name in labels.class_order:
         counts = np.asarray(histogram["counts_by_class"].get(class_name, []))
         if counts.sum() == 0:
             continue
-        ax.bar(edges[:-1], counts, width=width, bottom=bottom, align="edge",
-               color=CLASS_COLORS.get(class_name, "0.5"), edgecolor="white", lw=0.5, label=f"BOSS {class_name}")
+        ax.bar(np.radians(edges[:-1]), counts, width=width, bottom=bottom, align="edge",
+               color=CLASS_COLORS.get(class_name, "0.5"), edgecolor="white", lw=0.5, zorder=2,
+               label=f"BOSS {class_name}")
         bottom += counts
-    ax.axvline(0, color="black", ls="--", lw=1)
+
     stats = histogram.get("stats")
     if stats and stats["n"]:
+        ax.annotate("", xy=(np.radians(stats["mean_deg"]), stats["R"] * r_max), xytext=(0, 0),
+                    arrowprops={"arrowstyle": "-|>", "color": "black", "lw": 2}, zorder=4)
+        ax.plot([], [], color="black", lw=2, label="mean vector (R)")
         within = stats["pct_within"].get(str(tolerance_deg))
-        text = f"n={stats['n']}  mean={stats['mean_deg']:+.1f} deg  circ SD={stats['sd_deg']:.1f} deg  R={stats['R']:.2f}"
+        text = f"n={stats['n']}  mean={stats['mean_deg']:+.1f} deg  R={stats['R']:.2f}\ncirc SD={stats['sd_deg']:.1f} deg"
         if within is not None:
             text += f"  within +/-{tolerance_deg:g}: {within:.0f}%"
-        ax.set_title(f"{title}\n{text}" if title else text, fontsize=9)
-    ax.set_xlim(-180, 180)
-    ax.set_xticks(np.arange(-180, 181, 45))
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel("Epochs")
-    ax.legend(fontsize=8)
+        ax.set_title(f"{title}\n{text}" if title else text, fontsize=9, pad=14)
+    ax.set_ylim(0, r_max)
+    ax.set_xticks(np.radians([0, 45, 90, 135, 180, 225, 270, 315]))
+    ax.set_xticklabels(["0", "+45", "+90", "+135", "\u00b1180", "-135", "-90", "-45"])
+    ax.set_rlabel_position(112.5)
+    ax.tick_params(axis="y", labelsize=7, colors="0.4")
+    ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(0.92, 1.12), frameon=False)
     fig.tight_layout()
     return fig
 
 
-def plot_success_vs_tolerance(success: dict, ax=None, jitter: float = 0.09):
+def plot_success_vs_tolerance(
+    success: dict,
+    highlight_subject: str | None = None,
+    ax=None,
+    jitter: float = 0.09,
+):
     """% BOSS success vs tolerance: one dot per subject, paired lines, mean +/- SD, chance line.
 
     ``success`` is the output of ``boss_success_by_tolerance`` (tolerances plotted in
-    the given order). Jitter is deterministic so the figure is reproducible.
+    the given order). ``highlight_subject`` draws that subject in black and dims the
+    rest. Jitter is deterministic so the figure is reproducible.
     """
     fig, ax = _figure_axes(ax, figsize=(4.6, 4.4))
     tolerances = success["tolerances_deg"]
-    n_subjects = len(success["subjects"])
+    subjects = success["subjects"]
+    n_subjects = len(subjects)
     offsets = np.linspace(-jitter, jitter, n_subjects) if n_subjects > 1 else np.zeros(1)
     xs = np.arange(len(tolerances))
     by_tol = [success["by_tolerance"][str(t)] for t in tolerances]
+    dim = highlight_subject in subjects
 
-    for s in range(n_subjects):
+    for s, subject in enumerate(subjects):
         ys = [entry["success_pct"][s] for entry in by_tol]
-        ax.plot(xs + offsets[s], ys, color="0.75", lw=0.7, zorder=1)
-        ax.scatter(xs + offsets[s], ys, s=22, color=METHOD_COLORS["noncausal"], alpha=0.75, zorder=2,
-                   edgecolors="white", linewidths=0.5)
+        if subject == highlight_subject:
+            ax.plot(xs + offsets[s], ys, color="black", lw=1.8, zorder=4)
+            ax.scatter(xs + offsets[s], ys, s=46, color="black", zorder=5, edgecolors="white", linewidths=0.8,
+                       label=subject)
+            continue
+        ax.plot(xs + offsets[s], ys, color="0.85" if dim else "0.75", lw=0.7, zorder=1)
+        ax.scatter(xs + offsets[s], ys, s=22, color="0.7" if dim else METHOD_COLORS["noncausal"],
+                   alpha=0.75, zorder=2, edgecolors="white", linewidths=0.5)
     for x, entry in zip(xs, by_tol):
         if entry["mean_pct"] is not None:
             ax.hlines(entry["mean_pct"], x - 0.28, x + 0.28, color="black", lw=2.2, zorder=3)

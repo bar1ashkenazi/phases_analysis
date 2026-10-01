@@ -730,6 +730,28 @@ HTML_TEMPLATE = r"""<!doctype html>
       font-weight: 720;
     }
 
+    #successTable tbody tr[data-subject] {
+      cursor: pointer;
+    }
+
+    #successTable tbody tr[data-subject]:hover td {
+      background: var(--soft);
+    }
+
+    #successTable tr.highlighted td {
+      background: #20211f;
+      color: #ffffff;
+      font-weight: 720;
+    }
+
+    #successTable.dimmed tbody tr[data-subject]:not(.highlighted) td {
+      color: var(--muted);
+    }
+
+    .subject-hit {
+      cursor: pointer;
+    }
+
     .success-table tr.summary-line td {
       color: var(--ink);
       font-weight: 650;
@@ -908,16 +930,25 @@ HTML_TEMPLATE = r"""<!doctype html>
           </span>
         </div>
       </div>
-      <div class="deviation-wrap">
-        <svg id="deviationSvg" viewBox="0 0 1080 340" role="img" aria-label="Deviation histogram"></svg>
+      <div class="success-layout">
+        <div class="deviation-wrap">
+          <svg id="deviationSvg" viewBox="0 0 640 600" role="img" aria-label="Circular deviation histogram"></svg>
+        </div>
+        <div>
+          <table class="success-table" id="deviationStats"></table>
+          <p class="stats-line">Wedges: trials per 10° bin, stacked by BOSS class; 0° (no deviation) at the top, positive deviations clockwise. Arrow: mean resultant vector; its direction is the circular mean (bias) and its length is R (1 = all deviations identical, reaching the outer circle). Shaded: ±tolerance.</p>
+        </div>
       </div>
-      <p class="stats-line" id="deviationStats"></p>
     </section>
 
     <section class="success-section">
       <div class="signal-head">
         <h2>BOSS success vs tolerance</h2>
         <p class="subtle" id="successSubtitle"></p>
+      </div>
+      <div class="section-toolbar">
+        <label class="control">Highlight subject <select id="highlightSelect"></select></label>
+        <span class="subtle">or click a dot, line or table row</span>
       </div>
       <div class="success-layout">
         <div class="success-wrap">
@@ -955,7 +986,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       phaseMode: "noncausal",
       selectedTrialId: null,
       deviationKind: "boss_target",
-      deviationScope: "subject"
+      deviationScope: "subject",
+      highlightSubject: null
     };
     report.subjects.forEach(subject => subject.trials.forEach((trial, index) => { trial._index = index; }));
 
@@ -968,6 +1000,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     const signalSvg = document.getElementById("signalSvg");
     const deviationSvg = document.getElementById("deviationSvg");
     const successSvg = document.getElementById("successSvg");
+    const highlightSelect = document.getElementById("highlightSelect");
 
     function el(name, attrs = {}, text = null) {
       const node = document.createElementNS(NS, name);
@@ -1407,78 +1440,98 @@ HTML_TEMPLATE = r"""<!doctype html>
       const kind = state.deviationKind;
       const pooled = state.deviationScope === "pooled";
       const histogram = pooled ? analysis.pooled[kind] : currentAnalysis()?.deviations[kind];
-      const kindLabel = kind === "causal_error" ? "Causal − non-causal phase (deg)" : "Non-causal phase − BOSS target (deg)";
-      document.getElementById("deviationTitle").textContent = kind === "causal_error" ? "Causal estimator error" : "Phase deviation from BOSS target";
-      document.getElementById("deviationSubtitle").textContent = `${pooled ? "All subjects pooled" : currentSubject()?.id || ""}, 10 deg bins, +/-${state.tolerance} deg shaded`;
+      document.getElementById("deviationTitle").textContent = kind === "causal_error" ? "Causal estimator error (causal − non-causal)" : "Phase deviation from BOSS target (non-causal − target)";
+      document.getElementById("deviationSubtitle").textContent = `${pooled ? "All subjects pooled" : currentSubject()?.id || ""}, 10° bins, ±${state.tolerance}° shaded`;
       deviationSvg.replaceChildren();
+      const statsTable = document.getElementById("deviationStats");
 
       const stats = histogram?.stats;
       if (!histogram || !stats?.n) {
-        deviationSvg.appendChild(el("text", { x: 540, y: 170, class: "empty" }, "No deviations available"));
-        document.getElementById("deviationStats").textContent = "";
+        deviationSvg.appendChild(el("text", { x: 320, y: 300, class: "empty" }, "No deviations available"));
+        statsTable.innerHTML = "";
         return;
       }
 
-      const margin = { left: 64, right: 28, top: 24, bottom: 52 };
-      const width = 1080;
-      const height = 340;
-      const innerW = width - margin.left - margin.right;
-      const innerH = height - margin.top - margin.bottom;
+      const width = 640;
+      const height = 600;
+      const cx = width / 2;
+      const cy = 312;
+      const rMax = 230;
       const edges = histogram.bin_edges_deg;
       const nBins = edges.length - 1;
       const totals = Array.from({ length: nBins }, (_, i) => classOrder.reduce((sum, name) => sum + (histogram.counts_by_class[name]?.[i] || 0), 0));
-      const step = niceStep(Math.max(...totals), 5);
-      const yMax = Math.max(step, Math.ceil(Math.max(...totals) / step) * step);
-      const xScale = value => margin.left + ((value + 180) / 360) * innerW;
-      const yScale = value => margin.top + (1 - value / yMax) * innerH;
+      const maxTotal = Math.max(...totals, 1);
+      const step = niceStep(maxTotal, 4);
+      const countMax = maxTotal * 1.05;
+      const rScale = count => (count / countMax) * rMax;
 
       deviationSvg.appendChild(el("rect", { x: 0, y: 0, width, height, fill: "#ffffff" }));
-      deviationSvg.appendChild(el("rect", {
-        x: xScale(-state.tolerance), y: margin.top, width: xScale(state.tolerance) - xScale(-state.tolerance), height: innerH, fill: "#e4e6e2", opacity: "0.85"
-      }));
-      for (let value = 0; value <= yMax + 0.001; value += step) {
-        const y = yScale(value);
-        deviationSvg.appendChild(el("line", { x1: margin.left, x2: width - margin.right, y1: y, y2: y, stroke: "#edf0ea" }));
-        deviationSvg.appendChild(el("text", { x: margin.left - 10, y: y + 4, class: "axis-label", "text-anchor": "end" }, String(value)));
+      drawToleranceWindow(deviationSvg, cx, cy, 0, rMax, 0, state.tolerance);
+      deviationSvg.appendChild(el("circle", { cx, cy, r: rMax, fill: "none", stroke: "#cfd3cc" }));
+      for (let value = step; value <= countMax; value += step) {
+        deviationSvg.appendChild(el("circle", { cx, cy, r: rScale(value), fill: "none", stroke: "#e2e6df" }));
+        const [lx, ly] = polarPoint(cx, cy, rScale(value), 112.5);
+        deviationSvg.appendChild(el("text", { x: lx + 4, y: ly, class: "legend-text" }, String(value)));
       }
+      [0, 45, 90, 135, 180, 225, 270, 315].forEach(deg => {
+        const [x2, y2] = polarPoint(cx, cy, rMax, deg);
+        deviationSvg.appendChild(el("line", { x1: cx, y1: cy, x2, y2, stroke: deg === 0 ? "#3a3c38" : "#e2e6df", "stroke-dasharray": deg === 0 ? "3 4" : null }));
+        const [lx, ly] = polarPoint(cx, cy, rMax + 24, deg);
+        const label = deg === 0 ? "0°" : deg === 180 ? "±180°" : deg < 180 ? `+${deg}°` : `−${360 - deg}°`;
+        deviationSvg.appendChild(el("text", { x: lx, y: ly + 4, class: "axis-label", "text-anchor": "middle" }, label));
+      });
 
       for (let i = 0; i < nBins; i += 1) {
         let base = 0;
-        const x = xScale(edges[i]);
-        const barW = xScale(edges[i + 1]) - x;
         classOrder.forEach(name => {
           const count = histogram.counts_by_class[name]?.[i] || 0;
           if (!count) return;
-          const rect = el("rect", {
-            x: x + 0.5, y: yScale(base + count), width: Math.max(0, barW - 1), height: yScale(base) - yScale(base + count),
-            fill: colors[name] || "#858b93", opacity: "0.9"
+          const wedge = el("path", {
+            d: sectorPath(cx, cy, rScale(base), rScale(base + count), edges[i], edges[i + 1]),
+            fill: colors[name] || "#858b93", stroke: "#ffffff", "stroke-width": "0.8", opacity: "0.92"
           });
-          rect.appendChild(el("title", {}, `${edges[i]} to ${edges[i + 1]} deg | BOSS ${name}: ${count}`));
-          deviationSvg.appendChild(rect);
+          wedge.appendChild(el("title", {}, `${edges[i]}° to ${edges[i + 1]}° | BOSS ${name}: ${count}`));
+          deviationSvg.appendChild(wedge);
           base += count;
         });
       }
 
-      const zeroX = xScale(0);
-      deviationSvg.appendChild(el("line", { x1: zeroX, x2: zeroX, y1: margin.top, y2: height - margin.bottom, stroke: "#20211f", "stroke-dasharray": "4 4", "stroke-width": "1.2" }));
-      deviationSvg.appendChild(el("line", { x1: margin.left, y1: height - margin.bottom, x2: width - margin.right, y2: height - margin.bottom, stroke: "#aeb6ab" }));
-      for (let value = -180; value <= 180; value += 45) {
-        deviationSvg.appendChild(el("text", { x: xScale(value), y: height - margin.bottom + 18, class: "axis-label", "text-anchor": "middle" }, String(value)));
+      if (stats.R !== null && stats.mean_deg !== null) {
+        const [ax, ay] = polarPoint(cx, cy, stats.R * rMax, stats.mean_deg);
+        deviationSvg.appendChild(el("line", { x1: cx, y1: cy, x2: ax, y2: ay, stroke: "#20211f", "stroke-width": "3", "stroke-linecap": "round" }));
+        const theta = stats.mean_deg * Math.PI / 180;
+        const ux = Math.sin(theta);
+        const uy = -Math.cos(theta);
+        const head = [[ax + ux * 6, ay + uy * 6], [ax - ux * 8 - uy * 7, ay - uy * 8 + ux * 7], [ax - ux * 8 + uy * 7, ay - uy * 8 - ux * 7]];
+        deviationSvg.appendChild(el("path", { d: `M${head.map(p => p.map(v => v.toFixed(2)).join(",")).join(" L")} Z`, fill: "#20211f" }));
       }
-      deviationSvg.appendChild(el("text", { x: margin.left + innerW / 2, y: height - 10, class: "axis-label", "text-anchor": "middle" }, kindLabel));
-      deviationSvg.appendChild(el("text", { x: 18, y: 16, class: "axis-label" }, "Trials"));
+      deviationSvg.appendChild(el("circle", { cx, cy, r: 3, fill: "#20211f" }));
 
-      let ly = margin.top + 6;
+      let ly = 24;
       classOrder.forEach(name => {
         if (!histogram.counts_by_class[name]?.some(v => v)) return;
-        deviationSvg.appendChild(el("rect", { x: width - margin.right - 130, y: ly, width: 12, height: 12, fill: colors[name] || "#858b93" }));
-        deviationSvg.appendChild(el("text", { x: width - margin.right - 112, y: ly + 10, class: "legend-text" }, `BOSS ${name}`));
+        deviationSvg.appendChild(el("rect", { x: 16, y: ly - 10, width: 12, height: 12, fill: colors[name] || "#858b93" }));
+        deviationSvg.appendChild(el("text", { x: 34, y: ly, class: "legend-text" }, `BOSS ${name}`));
         ly += 20;
       });
+      deviationSvg.appendChild(el("line", { x1: 16, x2: 28, y1: ly - 4, y2: ly - 4, stroke: "#20211f", "stroke-width": "3" }));
+      deviationSvg.appendChild(el("text", { x: 34, y: ly, class: "legend-text" }, "mean vector"));
+      deviationSvg.appendChild(el("text", { x: width - 16, y: 24, class: "legend-text", "text-anchor": "end" }, "rings = trials"));
 
       const within = stats.pct_within[tolKey()];
-      document.getElementById("deviationStats").textContent =
-        `n = ${stats.n} trials · circular mean (bias) ${fmt(stats.mean_deg, 1, true)} deg · circular SD ${fmt(stats.sd_deg, 1)} deg · resultant length R = ${fmt(stats.R, 3)} · within +/-${state.tolerance} deg: ${fmt(within, 1)}%`;
+      const rows = [
+        ["Trials (n)", stats.n],
+        ["Circular mean (bias)", `${fmt(stats.mean_deg, 1, true)}°`],
+        ["Resultant length R", fmt(stats.R, 3)],
+        ["Circular SD", `${fmt(stats.sd_deg, 1)}°`],
+        [`Within ±${state.tolerance}°`, `${fmt(within, 1)}%`]
+      ];
+      statsTable.innerHTML = `<tbody>${rows.map(([k, v]) => `<tr><td>${htmlEscape(k)}</td><td>${htmlEscape(v)}</td></tr>`).join("")}</tbody>`;
+    }
+
+    function setHighlight(subjectId) {
+      state.highlightSubject = state.highlightSubject === subjectId ? null : subjectId;
+      renderAll();
     }
 
     function renderSuccess() {
@@ -1486,8 +1539,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       const tolerances = success.tolerances_deg;
       const subjects = success.subjects;
       const entries = tolerances.map(tol => success.by_tolerance[String(tol)]);
+      const highlight = subjects.includes(state.highlightSubject) ? state.highlightSubject : null;
+      highlightSelect.value = highlight || "";
       document.getElementById("successSubtitle").textContent =
-        `Non-causal phase within +/-T of the BOSS target, % of BOSS-labeled trials per subject (unclassified = failure). n = ${subjects.length} subjects; bar = mean, whiskers = ±1 SD; dashed = chance (2T/360).`;
+        `Non-causal phase within ±T of the BOSS target, % of BOSS-labeled trials per subject (unclassified = failure). n = ${subjects.length} subjects; bar = mean, whiskers = ±1 SD; dashed = chance (2T/360).`;
       successSvg.replaceChildren();
 
       const margin = { left: 64, right: 24, top: 24, bottom: 58 };
@@ -1499,6 +1554,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       const xCenter = i => margin.left + slot * (i + 0.5);
       const yScale = value => margin.top + (1 - value / 100) * innerH;
       const jitter = s => subjects.length > 1 ? (-0.13 + 0.26 * s / (subjects.length - 1)) * slot : 0;
+      const subjectPoints = s => entries.map((entry, i) => [xCenter(i) + jitter(s), entry.success_pct[s], i]).filter(([, v]) => v !== null);
+      const pathFor = points => points.map(([x, v], k) => `${k ? "L" : "M"}${x.toFixed(2)},${yScale(v).toFixed(2)}`).join("");
 
       successSvg.appendChild(el("rect", { x: 0, y: 0, width, height, fill: "#ffffff" }));
       for (let value = 0; value <= 100; value += 20) {
@@ -1522,46 +1579,64 @@ HTML_TEMPLATE = r"""<!doctype html>
       successSvg.appendChild(el("text", { x: legendX + 32, y: margin.top + 32, class: "legend-text" }, "mean ± SD"));
 
       subjects.forEach((subjectId, s) => {
-        const points = entries.map((entry, i) => [xCenter(i) + jitter(s), entry.success_pct[s]]).filter(([, v]) => v !== null);
+        if (subjectId === highlight) return;
+        const points = subjectPoints(s);
         if (points.length > 1) {
-          successSvg.appendChild(el("path", { d: points.map(([x, v], k) => `${k ? "L" : "M"}${x.toFixed(2)},${yScale(v).toFixed(2)}`).join(""), fill: "none", stroke: "#c3c7c0", "stroke-width": "1" }));
+          successSvg.appendChild(el("path", { d: pathFor(points), fill: "none", stroke: highlight ? "#dfe2dc" : "#c3c7c0", "stroke-width": "1" }));
         }
       });
       entries.forEach((entry, i) => {
         const x = xCenter(i);
-        if (entry.mean_pct !== null) {
-          if (entry.sd_pct !== null) {
-            const top = yScale(Math.min(100, entry.mean_pct + entry.sd_pct));
-            const bottom = yScale(Math.max(0, entry.mean_pct - entry.sd_pct));
-            successSvg.appendChild(el("line", { x1: x, x2: x, y1: top, y2: bottom, stroke: "#20211f", "stroke-width": "1.6" }));
-            [top, bottom].forEach(yy => successSvg.appendChild(el("line", { x1: x - 8, x2: x + 8, y1: yy, y2: yy, stroke: "#20211f", "stroke-width": "1.6" })));
-          }
-          const meanY = yScale(entry.mean_pct);
-          successSvg.appendChild(el("line", { x1: x - slot * 0.26, x2: x + slot * 0.26, y1: meanY, y2: meanY, stroke: "#20211f", "stroke-width": "3" }));
+        if (entry.mean_pct === null) return;
+        if (entry.sd_pct !== null) {
+          const top = yScale(Math.min(100, entry.mean_pct + entry.sd_pct));
+          const bottom = yScale(Math.max(0, entry.mean_pct - entry.sd_pct));
+          successSvg.appendChild(el("line", { x1: x, x2: x, y1: top, y2: bottom, stroke: "#20211f", "stroke-width": "1.6" }));
+          [top, bottom].forEach(yy => successSvg.appendChild(el("line", { x1: x - 8, x2: x + 8, y1: yy, y2: yy, stroke: "#20211f", "stroke-width": "1.6" })));
         }
-        subjects.forEach((subjectId, s) => {
-          const value = entry.success_pct[s];
-          if (value === null) return;
-          const isSelected = subjectId === state.subjectId;
+        const meanY = yScale(entry.mean_pct);
+        successSvg.appendChild(el("line", { x1: x - slot * 0.26, x2: x + slot * 0.26, y1: meanY, y2: meanY, stroke: "#20211f", "stroke-width": "3" }));
+      });
+
+      const drawSubject = (subjectId, s) => {
+        const isHighlighted = subjectId === highlight;
+        const points = subjectPoints(s);
+        if (isHighlighted && points.length > 1) {
+          successSvg.appendChild(el("path", { d: pathFor(points), fill: "none", stroke: "#20211f", "stroke-width": "2.4" }));
+        }
+        const hit = el("path", { d: pathFor(points), fill: "none", stroke: "transparent", "stroke-width": "10", class: "subject-hit", "data-subject": subjectId });
+        hit.appendChild(el("title", {}, subjectId));
+        successSvg.appendChild(hit);
+        points.forEach(([px, value, i]) => {
+          const entry = entries[i];
           const dot = el("circle", {
-            cx: (x + jitter(s)).toFixed(2), cy: yScale(value).toFixed(2), r: isSelected ? 6 : 4.5,
-            fill: methodColors.noncausal, opacity: isSelected ? "1" : "0.7", stroke: isSelected ? "#ffffff" : "none", "stroke-width": "1.5"
+            cx: px.toFixed(2), cy: yScale(value).toFixed(2), r: isHighlighted ? 6.5 : 4.5,
+            fill: isHighlighted ? "#20211f" : highlight ? "#b9bdb6" : methodColors.noncausal,
+            opacity: isHighlighted ? "1" : "0.75", stroke: "#ffffff", "stroke-width": isHighlighted ? "1.5" : "0.6",
+            class: "subject-hit", "data-subject": subjectId
           });
           dot.appendChild(el("title", {}, `${subjectId} | ±${tolerances[i]}°: ${entry.correct[s]}/${entry.n_labeled[s]} (${fmt(value, 1)}%)`));
           successSvg.appendChild(dot);
-          if (isSelected) successSvg.appendChild(el("circle", { cx: (x + jitter(s)).toFixed(2), cy: yScale(value).toFixed(2), r: 10, class: "selected-ring" }));
         });
-      });
+        if (isHighlighted && points.length) {
+          const [px, value] = points[0];
+          successSvg.appendChild(el("text", { x: px - 12, y: yScale(value) + 4, class: "legend-text", "text-anchor": "end", "font-weight": "700", fill: "#20211f" }, subjectId));
+        }
+      };
+      subjects.forEach((subjectId, s) => { if (subjectId !== highlight) drawSubject(subjectId, s); });
+      if (highlight) drawSubject(highlight, subjects.indexOf(highlight));
 
       const header = `<tr><th>Subject</th>${tolerances.map(t => `<th>±${t}°</th>`).join("")}</tr>`;
       const rows = subjects.map((subjectId, s) => `
-        <tr class="${subjectId === state.subjectId ? "selected" : ""}">
+        <tr data-subject="${htmlEscape(subjectId)}" class="${subjectId === highlight ? "highlighted" : ""}">
           <td>${htmlEscape(subjectId)}</td>
           ${entries.map(entry => `<td>${entry.correct[s]}/${entry.n_labeled[s]} (${fmt(entry.success_pct[s], 0)}%)</td>`).join("")}
         </tr>`).join("");
       const meanRow = `<tr class="summary-line"><td>mean ± SD</td>${entries.map(entry => `<td>${fmt(entry.mean_pct, 1)} ± ${fmt(entry.sd_pct, 1)}%</td>`).join("")}</tr>`;
       const chanceRow = `<tr class="summary-line"><td>chance</td>${entries.map(entry => `<td>${fmt(entry.chance_pct, 1)}%</td>`).join("")}</tr>`;
-      document.getElementById("successTable").innerHTML = `<thead>${header}</thead><tbody>${rows}${meanRow}${chanceRow}</tbody>`;
+      const table = document.getElementById("successTable");
+      table.classList.toggle("dimmed", Boolean(highlight));
+      table.innerHTML = `<thead>${header}</thead><tbody>${rows}${meanRow}${chanceRow}</tbody>`;
     }
 
     function renderParams() {
@@ -1633,6 +1708,18 @@ HTML_TEMPLATE = r"""<!doctype html>
       });
       setupSegmented(deviationKindButtons, "data-deviation-kind", value => { state.deviationKind = value; });
       setupSegmented(deviationScopeButtons, "data-deviation-scope", value => { state.deviationScope = value; });
+
+      highlightSelect.innerHTML = `<option value="">none</option>` + analysis.success.subjects.map(id => `<option value="${htmlEscape(id)}">${htmlEscape(id)}</option>`).join("");
+      highlightSelect.addEventListener("change", event => {
+        state.highlightSubject = event.target.value || null;
+        renderAll();
+      });
+      const highlightFromEvent = event => {
+        const target = event.target.closest("[data-subject]");
+        if (target) setHighlight(target.getAttribute("data-subject"));
+      };
+      successSvg.addEventListener("click", highlightFromEvent);
+      document.getElementById("successTable").addEventListener("click", highlightFromEvent);
 
       const selectTrial = event => {
         const target = event.target.closest("[data-trial-id]");
