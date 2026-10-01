@@ -19,7 +19,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 NEW_CODE = PROJECT_ROOT / "new_code"
-NOTEBOOK = NEW_CODE / "phase_pipeline_walkthrough.ipynb"
+NOTEBOOKS = [NEW_CODE / "phase_pipeline_walkthrough.ipynb", NEW_CODE / "phase_pipeline_minimal.ipynb"]
 if str(NEW_CODE) not in sys.path:
     sys.path.insert(0, str(NEW_CODE))
 if str(PROJECT_ROOT) not in sys.path:
@@ -108,15 +108,16 @@ def run_report_demo() -> None:
 def run_notebook_demo() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         env = {**os.environ, "PHASE_NOTEBOOK_DEMO": "1"}
-        subprocess.run(
-            [
-                sys.executable, "-m", "jupyter", "nbconvert", "--to", "notebook", "--execute",
-                "--ExecutePreprocessor.timeout=600", "--output-dir", tmp, str(NOTEBOOK),
-            ],
-            check=True,
-            env=env,
-            cwd=NEW_CODE,
-        )
+        for notebook in NOTEBOOKS:
+            subprocess.run(
+                [
+                    sys.executable, "-m", "jupyter", "nbconvert", "--to", "notebook", "--execute",
+                    "--ExecutePreprocessor.timeout=600", "--output-dir", tmp, str(notebook),
+                ],
+                check=True,
+                env=env,
+                cwd=NEW_CODE,
+            )
 
 
 def run_data_smoke(subject: str, n_trials: int, causal_params_mode: str) -> None:
@@ -148,7 +149,7 @@ def run_data_smoke(subject: str, n_trials: int, causal_params_mode: str) -> None
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--with-data", action="store_true", help="Run a small real-data smoke test if data is mounted.")
-    parser.add_argument("--notebook", action="store_true", help="Execute the walkthrough notebook in DEMO mode.")
+    parser.add_argument("--notebook", action="store_true", help="Execute the notebooks in DEMO mode.")
     parser.add_argument("--subject", default="sub_103")
     parser.add_argument("--n-trials", type=int, default=2)
     parser.add_argument(
