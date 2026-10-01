@@ -922,13 +922,7 @@ HTML_TEMPLATE = r"""<!doctype html>
             <button type="button" data-deviation-kind="causal_error">Causal − non-causal</button>
           </span>
         </div>
-        <div class="control">
-          Scope
-          <span class="segmented" id="deviationScopeButtons">
-            <button type="button" data-deviation-scope="subject">This subject</button>
-            <button type="button" data-deviation-scope="pooled">All subjects</button>
-          </span>
-        </div>
+        <label class="control">Subject <select id="deviationSubjectSelect"></select></label>
       </div>
       <div class="success-layout">
         <div class="deviation-wrap">
@@ -936,7 +930,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         </div>
         <div>
           <table class="success-table" id="deviationStats"></table>
-          <p class="stats-line">Wedges: trials per 10° bin, stacked by BOSS class; 0° (no deviation) at the top, positive deviations clockwise. Arrow: mean resultant vector; its direction is the circular mean (bias) and its length is R (1 = all deviations identical, reaching the outer circle). Shaded: ±tolerance.</p>
+          <p class="stats-line">Wedges: trials per 10° bin, stacked by BOSS class; 0° (no deviation) at the top, positive deviations clockwise. Arrows: mean resultant vector per BOSS class; direction = circular mean (bias), length = R (1 = all deviations identical, reaching the outer circle). Separate arrows keep opposite biases of positive and negative trials from cancelling out. Shaded: ±tolerance.</p>
         </div>
       </div>
     </section>
@@ -986,7 +980,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       phaseMode: "noncausal",
       selectedTrialId: null,
       deviationKind: "boss_target",
-      deviationScope: "subject",
+      deviationSubject: "",
       highlightSubject: null
     };
     report.subjects.forEach(subject => subject.trials.forEach((trial, index) => { trial._index = index; }));
@@ -995,7 +989,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     const toleranceButtons = document.getElementById("toleranceButtons");
     const methodButtons = document.getElementById("methodButtons");
     const deviationKindButtons = document.getElementById("deviationKindButtons");
-    const deviationScopeButtons = document.getElementById("deviationScopeButtons");
+    const deviationSubjectSelect = document.getElementById("deviationSubjectSelect");
     const phaseSvg = document.getElementById("phaseSvg");
     const signalSvg = document.getElementById("signalSvg");
     const deviationSvg = document.getElementById("deviationSvg");
@@ -1438,10 +1432,11 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     function renderDeviation() {
       const kind = state.deviationKind;
-      const pooled = state.deviationScope === "pooled";
-      const histogram = pooled ? analysis.pooled[kind] : currentAnalysis()?.deviations[kind];
+      const pooled = !analysis.subjects[state.deviationSubject];
+      const histogram = pooled ? analysis.pooled[kind] : analysis.subjects[state.deviationSubject].deviations[kind];
+      deviationSubjectSelect.value = pooled ? "" : state.deviationSubject;
       document.getElementById("deviationTitle").textContent = kind === "causal_error" ? "Causal estimator error (causal − non-causal)" : "Phase deviation from BOSS target (non-causal − target)";
-      document.getElementById("deviationSubtitle").textContent = `${pooled ? "All subjects pooled" : currentSubject()?.id || ""}, 10° bins, ±${state.tolerance}° shaded`;
+      document.getElementById("deviationSubtitle").textContent = `${pooled ? "All subjects pooled" : state.deviationSubject}, 10° bins, ±${state.tolerance}° shaded`;
       deviationSvg.replaceChildren();
       const statsTable = document.getElementById("deviationStats");
 
@@ -1496,15 +1491,24 @@ HTML_TEMPLATE = r"""<!doctype html>
         });
       }
 
-      if (stats.R !== null && stats.mean_deg !== null) {
-        const [ax, ay] = polarPoint(cx, cy, stats.R * rMax, stats.mean_deg);
-        deviationSvg.appendChild(el("line", { x1: cx, y1: cy, x2: ax, y2: ay, stroke: "#20211f", "stroke-width": "3", "stroke-linecap": "round" }));
-        const theta = stats.mean_deg * Math.PI / 180;
+      const arrowClasses = classOrder.filter(name => histogram.stats_by_class?.[name]?.n);
+      arrowClasses.forEach(name => {
+        const classStats = histogram.stats_by_class[name];
+        const [ax, ay] = polarPoint(cx, cy, classStats.R * rMax, classStats.mean_deg);
+        const theta = classStats.mean_deg * Math.PI / 180;
         const ux = Math.sin(theta);
         const uy = -Math.cos(theta);
-        const head = [[ax + ux * 6, ay + uy * 6], [ax - ux * 8 - uy * 7, ay - uy * 8 + ux * 7], [ax - ux * 8 + uy * 7, ay - uy * 8 - ux * 7]];
-        deviationSvg.appendChild(el("path", { d: `M${head.map(p => p.map(v => v.toFixed(2)).join(",")).join(" L")} Z`, fill: "#20211f" }));
-      }
+        const head = [[ax + ux * 7, ay + uy * 7], [ax - ux * 9 - uy * 8, ay - uy * 9 + ux * 8], [ax - ux * 9 + uy * 8, ay - uy * 9 - ux * 8]];
+        const headPath = `M${head.map(p => p.map(v => v.toFixed(2)).join(",")).join(" L")} Z`;
+        const color = colors[name] || "#858b93";
+        const group = el("g");
+        group.appendChild(el("title", {}, `BOSS ${name}: mean ${fmt(classStats.mean_deg, 1, true)}°, R ${fmt(classStats.R, 3)}, n ${classStats.n}`));
+        group.appendChild(el("line", { x1: cx, y1: cy, x2: ax, y2: ay, stroke: "#ffffff", "stroke-width": "7", "stroke-linecap": "round" }));
+        group.appendChild(el("path", { d: headPath, fill: "#ffffff", stroke: "#ffffff", "stroke-width": "4", "stroke-linejoin": "round" }));
+        group.appendChild(el("line", { x1: cx, y1: cy, x2: ax, y2: ay, stroke: color, "stroke-width": "3.5", "stroke-linecap": "round" }));
+        group.appendChild(el("path", { d: headPath, fill: color }));
+        deviationSvg.appendChild(group);
+      });
       deviationSvg.appendChild(el("circle", { cx, cy, r: 3, fill: "#20211f" }));
 
       let ly = 24;
@@ -1514,19 +1518,21 @@ HTML_TEMPLATE = r"""<!doctype html>
         deviationSvg.appendChild(el("text", { x: 34, y: ly, class: "legend-text" }, `BOSS ${name}`));
         ly += 20;
       });
-      deviationSvg.appendChild(el("line", { x1: 16, x2: 28, y1: ly - 4, y2: ly - 4, stroke: "#20211f", "stroke-width": "3" }));
-      deviationSvg.appendChild(el("text", { x: 34, y: ly, class: "legend-text" }, "mean vector"));
+      deviationSvg.appendChild(el("text", { x: 16, y: ly, class: "legend-text" }, "arrows = class mean vectors"));
       deviationSvg.appendChild(el("text", { x: width - 16, y: 24, class: "legend-text", "text-anchor": "end" }, "rings = trials"));
 
-      const within = stats.pct_within[tolKey()];
+      const columns = [["All", stats], ...arrowClasses.map(name => [name, histogram.stats_by_class[name]])];
       const rows = [
-        ["Trials (n)", stats.n],
-        ["Circular mean (bias)", `${fmt(stats.mean_deg, 1, true)}°`],
-        ["Resultant length R", fmt(stats.R, 3)],
-        ["Circular SD", `${fmt(stats.sd_deg, 1)}°`],
-        [`Within ±${state.tolerance}°`, `${fmt(within, 1)}%`]
+        ["Trials (n)", st => String(st.n)],
+        ["Circular mean (bias)", st => `${fmt(st.mean_deg, 1, true)}°`],
+        ["Resultant length R", st => fmt(st.R, 3)],
+        ["Circular SD", st => `${fmt(st.sd_deg, 1)}°`],
+        [`Within ±${state.tolerance}°`, st => `${fmt(st.pct_within[tolKey()], 1)}%`]
       ];
-      statsTable.innerHTML = `<tbody>${rows.map(([k, v]) => `<tr><td>${htmlEscape(k)}</td><td>${htmlEscape(v)}</td></tr>`).join("")}</tbody>`;
+      const head = `<tr><th></th>${columns.map(([name]) => name === "All"
+        ? "<th>All</th>"
+        : `<th><span style="color:${htmlEscape(colors[name] || "#858b93")}">■</span> ${htmlEscape(name)}</th>`).join("")}</tr>`;
+      statsTable.innerHTML = `<thead>${head}</thead><tbody>${rows.map(([label, value]) => `<tr><td>${htmlEscape(label)}</td>${columns.map(([, st]) => `<td>${htmlEscape(value(st))}</td>`).join("")}</tr>`).join("")}</tbody>`;
     }
 
     function setHighlight(subjectId) {
@@ -1707,7 +1713,11 @@ HTML_TEMPLATE = r"""<!doctype html>
         if (!report.causal_available && button.dataset.deviationKind === "causal_error") button.disabled = true;
       });
       setupSegmented(deviationKindButtons, "data-deviation-kind", value => { state.deviationKind = value; });
-      setupSegmented(deviationScopeButtons, "data-deviation-scope", value => { state.deviationScope = value; });
+      deviationSubjectSelect.innerHTML = `<option value="">All subjects (pooled)</option>` + report.subjects.map(subject => `<option value="${htmlEscape(subject.id)}">${htmlEscape(subject.id)}</option>`).join("");
+      deviationSubjectSelect.addEventListener("change", event => {
+        state.deviationSubject = event.target.value;
+        renderAll();
+      });
 
       highlightSelect.innerHTML = `<option value="">none</option>` + analysis.success.subjects.map(id => `<option value="${htmlEscape(id)}">${htmlEscape(id)}</option>`).join("");
       highlightSelect.addEventListener("change", event => {
@@ -1743,7 +1753,6 @@ HTML_TEMPLATE = r"""<!doctype html>
       toggle(toleranceButtons, "data-tolerance", state.tolerance);
       toggle(methodButtons, "data-phase-mode", state.phaseMode);
       toggle(deviationKindButtons, "data-deviation-kind", state.deviationKind);
-      toggle(deviationScopeButtons, "data-deviation-scope", state.deviationScope);
     }
 
     function renderRunMeta() {

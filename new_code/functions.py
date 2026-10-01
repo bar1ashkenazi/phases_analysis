@@ -967,6 +967,29 @@ def deviation_histogram(
     return {"bin_edges_deg": edges.tolist(), "counts_by_class": counts}
 
 
+def deviation_summary(
+    deviations_deg: Sequence[float],
+    boss_labels: Sequence[str],
+    tolerances_deg: Sequence[float],
+    bin_width_deg: float = 10.0,
+    labels: LabelScheme = DEFAULT_LABELS,
+) -> dict:
+    """Histogram + circular stats for all epochs (``stats``) and per BOSS class (``stats_by_class``).
+
+    Per-class stats matter because opposite biases for positive and negative epochs
+    would cancel in the pooled mean.
+    """
+    values = np.asarray(deviations_deg, dtype=float)
+    boss = np.asarray(boss_labels, dtype=object)
+    return {
+        **deviation_histogram(values, boss, bin_width_deg, labels),
+        "stats": circular_stats(values, tolerances_deg),
+        "stats_by_class": {
+            name: circular_stats(values[boss == name], tolerances_deg) for name in labels.class_order
+        },
+    }
+
+
 def _sample_sd(values: Sequence[float]) -> float | None:
     return float(np.std(values, ddof=1)) if len(values) > 1 else None
 
@@ -1036,19 +1059,13 @@ def analyze_phase_results(
             "boss_target": boss_target_deviations(boss, phases["noncausal"], labels),
         }
         for kind, values in deviations.items():
-            subject_out["deviations"][kind] = {
-                **deviation_histogram(values, boss, bin_width_deg, labels),
-                "stats": circular_stats(values, tolerances_deg),
-            }
+            subject_out["deviations"][kind] = deviation_summary(values, boss, tolerances_deg, bin_width_deg, labels)
             pooled[kind][0].extend(values.tolist())
             pooled[kind][1].extend(boss)
         out["subjects"][subject_id] = subject_out
 
     for kind, (values, boss) in pooled.items():
-        out["pooled"][kind] = {
-            **deviation_histogram(values, boss, bin_width_deg, labels),
-            "stats": circular_stats(values, tolerances_deg),
-        }
+        out["pooled"][kind] = deviation_summary(values, boss, tolerances_deg, bin_width_deg, labels)
 
     out["success"] = boss_success_by_tolerance(
         {sid: (data["boss"], data["noncausal_deg"]) for sid, data in subjects.items()},
@@ -1156,9 +1173,10 @@ def plot_deviation_histogram(
     """Circular (rose) histogram from ``deviation_histogram`` / ``analyze_phase_results``.
 
     0 deg (no deviation) is at the top and positive deviations run clockwise. Wedges are
-    stacked by BOSS class, wedge length = epoch count. The shaded sector is +/-tolerance,
-    and the arrow is the mean resultant vector: its direction is the circular mean (bias),
-    its length is R (1 = all deviations identical) relative to the outer ring.
+    stacked by BOSS class, wedge length = epoch count. The shaded sector is +/-tolerance.
+    One vector (line ending in a dot) per BOSS class is that class's mean resultant
+    vector: direction = circular mean (bias), length = R (1 = all deviations identical) relative to the outer ring.
+    The title gives the pooled statistics.
     """
     fig, ax = _figure_axes(ax, figsize=(5.2, 5.4), subplot_kw={"projection": "polar"})
     ax.set_theta_zero_location("N")
@@ -1180,11 +1198,19 @@ def plot_deviation_histogram(
                label=f"BOSS {class_name}")
         bottom += counts
 
+    for class_name, class_stats in histogram.get("stats_by_class", {}).items():
+        if not class_stats["n"]:
+            continue
+        color = CLASS_COLORS.get(class_name, "0.5")
+        theta = np.radians(class_stats["mean_deg"])
+        radius = class_stats["R"] * r_max
+        ax.plot([theta, theta], [0, radius], color="white", lw=6, solid_capstyle="round", zorder=4)
+        ax.plot([theta, theta], [0, radius], color=color, lw=3, solid_capstyle="round", zorder=5,
+                marker="o", markevery=[1], markersize=8, markeredgecolor="white", markeredgewidth=1.2)
+        ax.plot([], [], color=color, lw=3, label=f"mean vector {class_name}")
+
     stats = histogram.get("stats")
     if stats and stats["n"]:
-        ax.annotate("", xy=(np.radians(stats["mean_deg"]), stats["R"] * r_max), xytext=(0, 0),
-                    arrowprops={"arrowstyle": "-|>", "color": "black", "lw": 2}, zorder=4)
-        ax.plot([], [], color="black", lw=2, label="mean vector (R)")
         within = stats["pct_within"].get(str(tolerance_deg))
         text = f"n={stats['n']}  mean={stats['mean_deg']:+.1f} deg  R={stats['R']:.2f}\ncirc SD={stats['sd_deg']:.1f} deg"
         if within is not None:
