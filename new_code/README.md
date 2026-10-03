@@ -4,8 +4,10 @@ All analysis logic lives in `functions.py` (single source of truth). Parameters 
 paths live in `settings.py`. Everything else only calls `functions.py` and renders
 the results.
 
-Terminology: one epoch = one trial (one stimulus event around t=0). An Optuna
-"trial" (`OPT_N_TRIALS`) is one candidate causal parameter set, not an EEG epoch.
+Terminology: an epoch is the EEG window around one stimulation event (one BOSS
+decision, t=0); a memory-task trial contains several. Epochs are analyzed
+independently. An Optuna "trial" (`OPT_N_TRIALS`) is one candidate causal parameter
+set, not an EEG epoch.
 
 Files:
 

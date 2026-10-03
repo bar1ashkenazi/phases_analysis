@@ -3,7 +3,9 @@
 This module is the single source of analysis logic. Runners, the HTML report and the
 walkthrough notebook only call these functions and render what they return.
 
-Terminology: one epoch = one trial = one stimulus event cut out around t=0. An Optuna
+Terminology: an epoch is the EEG window cut around one stimulation event (one BOSS
+decision, t=0). A memory-task trial contains several such events; epochs are analyzed
+independently. Names like ``TrialEstimate`` / ``n_trials`` refer to epochs. An Optuna
 "trial" (``n_opt_trials``) is something else: one evaluated causal parameter set.
 
 The non-causal phase estimate intentionally follows the working logic in
