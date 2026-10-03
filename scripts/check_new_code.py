@@ -80,14 +80,16 @@ def run_synthetic_tests() -> None:
     arrays = f.estimates_to_arrays(estimates)
     analysis = f.analyze_phase_results({data.subject: arrays}, tolerances_deg=s.TOLERANCES_DEG)
     for tol in s.TOLERANCES_DEG:
-        labeled = [e for e in estimates if e.label in (f.DEFAULT_LABELS.positive, f.DEFAULT_LABELS.negative)]
+        labeled = [e for e in estimates if e.label in (f.POSITIVE, f.NEGATIVE)]
         correct = sum(f.classify_phase(e.phase_deg, tol) == e.label for e in labeled)
         entry = analysis["success"]["by_tolerance"][str(tol)]
         assert entry["correct"][0] == correct and entry["n_labeled"][0] == len(labeled)
         assert np.isclose(entry["chance_pct"], 100 * 2 * tol / 360)
 
-    hist = analysis["subjects"][data.subject]["deviations"]["boss_target"]
+    hist = analysis["subjects"][data.subject]["histograms"]["boss_target"]
     assert sum(sum(c) for c in hist["counts_by_class"].values()) == hist["stats"]["n"]
+    phase_hist = analysis["subjects"][data.subject]["histograms"]["noncausal_phase"]
+    assert phase_hist["axis"] == "phase" and sum(sum(c) for c in phase_hist["counts_by_class"].values()) == len(estimates)
     stats = f.circular_stats([10.0, 10.0, 10.0], tolerances_deg=[15])
     assert np.isclose(stats["mean_deg"], 10.0) and np.isclose(stats["R"], 1.0) and stats["pct_within"]["15"] == 100.0
     assert f.resolve_noncausal_filter_order(None, 350) == 350

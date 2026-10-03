@@ -7,7 +7,7 @@ Edit the CAPS settings below. They are used by ``run_intake_phase_html_report.py
 
 from pathlib import Path
 
-from functions import DEFAULT_LABELS, LoadConfig
+from functions import LoadConfig
 
 
 # ---- Subjects and data ---------------------------------------------------
@@ -30,7 +30,6 @@ HJORTH_SCALE_REFERENCE = "Fz"
 
 CONDITION_COLUMN = "Condition"
 CONDITION_AUTO_KEYWORDS = ("condition", "boss", "classification", "class")
-LABELS = DEFAULT_LABELS  # class names + raw metadata values for positive/negative
 
 DOWNSAMPLE = True
 DOWNSAMPLE_FS = 1000.0
@@ -52,7 +51,6 @@ LOAD_CONFIG = LoadConfig(
     hjorth_channel=HJORTH_CHANNEL,
     hjorth_weights=HJORTH_WEIGHTS,
     hjorth_scale_reference=HJORTH_SCALE_REFERENCE,
-    labels=LABELS,
     show_metadata_summary=SHOW_METADATA_SUMMARY,
     metadata_max_values=METADATA_MAX_VALUES,
 )

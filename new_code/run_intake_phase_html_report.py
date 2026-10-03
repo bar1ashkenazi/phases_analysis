@@ -56,8 +56,13 @@ import matplotlib.pyplot as plt
 
 import settings
 from functions import (
+    BOSS_CLASSES,
     CLASS_COLORS,
     METHOD_COLORS,
+    NEGATIVE,
+    POSITIVE,
+    UNCLASSIFIED,
+    UNKNOWN,
     EpochEstimate,
     analyze_phase_results,
     estimate_all_subjects,
@@ -72,7 +77,6 @@ REPORT_DIR = Path("new_code/intake_phase_report")
 CACHE_FILENAME = "intake_phase_results.json"
 HTML_FILENAME = "intake_phase_report.html"
 SUCCESS_FIGURE_STEM = "success_vs_tolerance"
-HISTOGRAM_BIN_WIDTH_DEG = 10.0
 MAX_SIGNAL_POINTS = 4000
 FLOAT_DECIMALS = 6
 SIGNAL_SCALE = 1_000_000.0
@@ -239,12 +243,12 @@ def estimates_to_payload(
             "signal_scale": SIGNAL_SCALE,
         },
         "class_names": {
-            "positive": settings.LABELS.positive,
-            "negative": settings.LABELS.negative,
-            "unknown": settings.LABELS.unknown,
-            "unclassified": settings.LABELS.unclassified,
+            "positive": POSITIVE,
+            "negative": NEGATIVE,
+            "unknown": UNKNOWN,
+            "unclassified": UNCLASSIFIED,
         },
-        "class_order": list(settings.LABELS.class_order),
+        "class_order": list(BOSS_CLASSES),
         "max_signal_points": MAX_SIGNAL_POINTS,
         "causal_available": causal_available,
         "total_epochs": total_epochs,
@@ -312,8 +316,6 @@ def prepare_report(payload: dict[str, Any]) -> dict[str, Any]:
             for subject in subjects
         },
         tolerances_deg=list(settings.TOLERANCES_DEG),
-        bin_width_deg=HISTOGRAM_BIN_WIDTH_DEG,
-        labels=settings.LABELS,
     ))
     return report
 
@@ -419,7 +421,6 @@ def make_demo_payload() -> dict[str, Any]:
             n_epochs=DEMO_EPOCHS,
             phase_jitter_deg=20.0 + 8.0 * i,
             seed=7 + i,
-            labels=settings.LABELS,
         )
         for i in range(DEMO_SUBJECTS)
     ]
@@ -937,8 +938,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
       <div class="section-toolbar">
         <div class="control">
-          Deviation
+          Show
           <span class="segmented" id="deviationKindButtons">
+            <button type="button" data-deviation-kind="noncausal_phase">Non-causal phase</button>
             <button type="button" data-deviation-kind="boss_target">Phase − BOSS target</button>
             <button type="button" data-deviation-kind="causal_error">Causal − non-causal</button>
           </span>
@@ -951,7 +953,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         </div>
         <div>
           <table class="success-table" id="deviationStats"></table>
-          <p class="stats-line">Wedges: epochs per 10° bin, stacked by BOSS class; 0° (no deviation) at the top, positive deviations clockwise. Arrows: mean resultant vector per BOSS class; direction = circular mean (bias), length = R (1 = all deviations identical, reaching the outer circle). Separate arrows keep opposite biases of positive and negative epochs from cancelling out. Shaded: ±tolerance.</p>
+          <p class="stats-line" id="deviationNote"></p>
         </div>
       </div>
     </section>
@@ -1454,16 +1456,24 @@ HTML_TEMPLATE = r"""<!doctype html>
     function renderDeviation() {
       const kind = state.deviationKind;
       const pooled = !analysis.subjects[state.deviationSubject];
-      const histogram = pooled ? analysis.pooled[kind] : analysis.subjects[state.deviationSubject].deviations[kind];
+      const histogram = pooled ? analysis.pooled[kind] : analysis.subjects[state.deviationSubject].histograms[kind];
+      const isPhase = histogram?.axis === "phase";
       deviationSubjectSelect.value = pooled ? "" : state.deviationSubject;
-      document.getElementById("deviationTitle").textContent = kind === "causal_error" ? "Causal estimator error (causal − non-causal)" : "Phase deviation from BOSS target (non-causal − target)";
+      document.getElementById("deviationTitle").textContent = {
+        noncausal_phase: "Non-causal phase at the stimulus, by BOSS label",
+        boss_target: "Phase deviation from BOSS target (non-causal − target)",
+        causal_error: "Causal estimator error (causal − non-causal)"
+      }[kind];
+      document.getElementById("deviationNote").textContent = isPhase
+        ? "Wedges: epochs per 10° bin of non-causal phase, stacked by BOSS label; 0° (positive peak) at the top, clockwise. Shaded: ±tolerance around 0° (positive target) and 180° (negative target). Arrows: mean resultant vector per BOSS label; direction = circular mean phase, length = R (1 = all phases identical, reaching the outer circle)."
+        : "Wedges: epochs per 10° bin, stacked by BOSS class; 0° (no deviation) at the top, positive deviations clockwise. Arrows: mean resultant vector per BOSS class; direction = circular mean (bias), length = R (1 = all deviations identical, reaching the outer circle). Separate arrows keep opposite biases of positive and negative epochs from cancelling out. Shaded: ±tolerance.";
       document.getElementById("deviationSubtitle").textContent = `${pooled ? "All subjects pooled" : state.deviationSubject}, 10° bins, ±${state.tolerance}° shaded`;
       deviationSvg.replaceChildren();
       const statsTable = document.getElementById("deviationStats");
 
       const stats = histogram?.stats;
       if (!histogram || !stats?.n) {
-        deviationSvg.appendChild(el("text", { x: 320, y: 300, class: "empty" }, "No deviations available"));
+        deviationSvg.appendChild(el("text", { x: 320, y: 300, class: "empty" }, "No data available"));
         statsTable.innerHTML = "";
         return;
       }
@@ -1482,7 +1492,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       const rScale = count => (count / countMax) * rMax;
 
       deviationSvg.appendChild(el("rect", { x: 0, y: 0, width, height, fill: "#ffffff" }));
-      drawToleranceWindow(deviationSvg, cx, cy, 0, rMax, 0, state.tolerance);
+      const targets = isPhase ? [0, 180] : [0];
+      targets.forEach(center => drawToleranceWindow(deviationSvg, cx, cy, 0, rMax, center, state.tolerance));
       deviationSvg.appendChild(el("circle", { cx, cy, r: rMax, fill: "none", stroke: "#cfd3cc" }));
       for (let value = step; value <= countMax; value += step) {
         deviationSvg.appendChild(el("circle", { cx, cy, r: rScale(value), fill: "none", stroke: "#e2e6df" }));
@@ -1491,9 +1502,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       [0, 45, 90, 135, 180, 225, 270, 315].forEach(deg => {
         const [x2, y2] = polarPoint(cx, cy, rMax, deg);
-        deviationSvg.appendChild(el("line", { x1: cx, y1: cy, x2, y2, stroke: deg === 0 ? "#3a3c38" : "#e2e6df", "stroke-dasharray": deg === 0 ? "3 4" : null }));
+        const isTarget = targets.includes(deg);
+        deviationSvg.appendChild(el("line", { x1: cx, y1: cy, x2, y2, stroke: isTarget ? "#3a3c38" : "#e2e6df", "stroke-dasharray": isTarget ? "3 4" : null }));
         const [lx, ly] = polarPoint(cx, cy, rMax + 24, deg);
-        const label = deg === 0 ? "0°" : deg === 180 ? "±180°" : deg < 180 ? `+${deg}°` : `−${360 - deg}°`;
+        const label = isPhase || deg === 0 ? `${deg}°` : deg === 180 ? "±180°" : deg < 180 ? `+${deg}°` : `−${360 - deg}°`;
         deviationSvg.appendChild(el("text", { x: lx, y: ly + 4, class: "axis-label", "text-anchor": "middle" }, label));
       });
 
@@ -1523,7 +1535,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         const headPath = `M${head.map(p => p.map(v => v.toFixed(2)).join(",")).join(" L")} Z`;
         const color = colors[name] || "#858b93";
         const group = el("g");
-        group.appendChild(el("title", {}, `BOSS ${name}: mean ${fmt(classStats.mean_deg, 1, true)}°, R ${fmt(classStats.R, 3)}, n ${classStats.n}`));
+        group.appendChild(el("title", {}, `BOSS ${name}: mean ${fmt(classStats.mean_deg, 1, !isPhase)}°, R ${fmt(classStats.R, 3)}, n ${classStats.n}`));
         group.appendChild(el("line", { x1: cx, y1: cy, x2: ax, y2: ay, stroke: "#ffffff", "stroke-width": "7", "stroke-linecap": "round" }));
         group.appendChild(el("path", { d: headPath, fill: "#ffffff", stroke: "#ffffff", "stroke-width": "4", "stroke-linejoin": "round" }));
         group.appendChild(el("line", { x1: cx, y1: cy, x2: ax, y2: ay, stroke: color, "stroke-width": "3.5", "stroke-linecap": "round" }));
@@ -1542,13 +1554,14 @@ HTML_TEMPLATE = r"""<!doctype html>
       deviationSvg.appendChild(el("text", { x: 16, y: ly, class: "legend-text" }, "arrows = class mean vectors"));
       deviationSvg.appendChild(el("text", { x: width - 16, y: 24, class: "legend-text", "text-anchor": "end" }, "rings = epochs"));
 
-      const columns = [["All", stats], ...arrowClasses.map(name => [name, histogram.stats_by_class[name]])];
+      const classColumns = arrowClasses.map(name => [name, histogram.stats_by_class[name]]);
+      const columns = isPhase ? classColumns : [["All", stats], ...classColumns];
       const rows = [
         ["Epochs (n)", st => String(st.n)],
-        ["Circular mean (bias)", st => `${fmt(st.mean_deg, 1, true)}°`],
+        [isPhase ? "Circular mean phase" : "Circular mean (bias)", st => `${fmt(st.mean_deg, 1, !isPhase)}°`],
         ["Resultant length R", st => fmt(st.R, 3)],
         ["Circular SD", st => `${fmt(st.sd_deg, 1)}°`],
-        [`Within ±${state.tolerance}°`, st => `${fmt(st.pct_within[tolKey()], 1)}%`]
+        ...(isPhase ? [] : [[`Within ±${state.tolerance}°`, st => `${fmt(st.pct_within[tolKey()], 1)}%`]])
       ];
       const head = `<tr><th></th>${columns.map(([name]) => name === "All"
         ? "<th>All</th>"
