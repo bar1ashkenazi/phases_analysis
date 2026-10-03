@@ -6,7 +6,7 @@ optuna>=4.0
 scikit-learn>=1.3   # optuna.importance.get_param_importances
 matplotlib>=3.7
 
-# Walkthrough notebook (new_code/phase_pipeline_walkthrough.ipynb)
+# Notebook (new_code/phase_pipeline.ipynb)
 jupyter
 ipykernel
 nbconvert
