@@ -1131,6 +1131,64 @@ def plot_trial_signal(
     return fig
 
 
+def plot_epoch_estimates(
+    x: np.ndarray,
+    times_ms: np.ndarray,
+    noncausal: dict,
+    causal: CausalEstimate | None,
+    band: tuple[float, float],
+    cutoff_ms: float,
+    title: str = "",
+    window_ms: tuple[float, float] = (-600.0, 300.0),
+):
+    """One epoch, step by step, in three stacked panels sharing the time axis (signal in uV).
+
+    1. raw signal; 2. raw + non-causal filtfilt trace with its phase at the cutoff;
+    3. non-causal reference + causal filtered core and AR forecast with the causal phase.
+    ``noncausal`` / ``causal`` are the outputs of ``noncausal_phase`` / ``causal_phase``.
+    """
+    fig, axes = plt.subplots(3, 1, figsize=(10, 7.5), sharex=True)
+    mask = _time_window_mask(times_ms, window_ms)
+    t = times_ms[mask]
+    raw = x[mask] * 1e6
+    filtered = noncausal["filtered"][mask] * 1e6
+
+    axes[0].plot(t, raw, color=METHOD_COLORS["raw"], lw=0.8)
+    axes[0].set_title("1. Raw signal", fontsize=10, loc="left")
+
+    axes[1].plot(t, raw, color=METHOD_COLORS["raw"], lw=0.6, alpha=0.6, label="raw")
+    axes[1].plot(t, filtered, color=METHOD_COLORS["noncausal"], lw=1.6,
+                 label=f"non-causal filtfilt {band[0]:g}-{band[1]:g} Hz")
+    axes[1].set_title(f"2. Non-causal (uses the whole epoch): phase at t=0 = {noncausal['phase_deg']:.1f} deg",
+                      fontsize=10, loc="left")
+
+    axes[2].plot(t, filtered, color=METHOD_COLORS["noncausal"], lw=1.4, label="non-causal (reference)")
+    if causal is not None:
+        core_mask = _time_window_mask(causal.core_times_ms, window_ms)
+        future_mask = _time_window_mask(causal.future_times_ms, window_ms)
+        axes[2].plot(causal.core_times_ms[core_mask], causal.core[core_mask] * 1e6,
+                     color=METHOD_COLORS["causal"], lw=1.6, label="causal: filtered pre-stimulus core")
+        axes[2].plot(causal.future_times_ms[future_mask], causal.pred_future[future_mask] * 1e6,
+                     color=METHOD_COLORS["causal"], lw=1.6, ls="--", label="causal: AR forecast")
+        diff = signed_angular_difference_deg(causal.phase_deg, noncausal["phase_deg"])
+        axes[2].set_title(f"3. Causal (only data before t=0): phase = {causal.phase_deg:.1f} deg "
+                          f"(causal - non-causal = {diff:+.1f} deg)", fontsize=10, loc="left")
+    else:
+        axes[2].set_title("3. Causal: unavailable for these parameters", fontsize=10, loc="left")
+
+    for ax in axes:
+        ax.axvline(cutoff_ms, color="gray", ls=":", lw=1.2)
+        ax.set_ylabel("uV")
+        ax.spines[["top", "right"]].set_visible(False)
+    for ax in axes[1:]:
+        ax.legend(fontsize=8, loc="upper left", frameon=False)
+    axes[-1].set_xlabel("Time relative to stimulus (ms)")
+    if title:
+        fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+    return fig
+
+
 def plot_phase_circle(
     phases_deg: Sequence[float | None],
     boss_labels: Sequence[str],

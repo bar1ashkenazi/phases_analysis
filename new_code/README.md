@@ -20,8 +20,8 @@ Files:
 - `phase_pipeline_walkthrough.ipynb`: step-by-step notebook (load one epoch as a
   NumPy array, each processing step with plots and parameter explanations, final
   results). Update `DATA_ROOT` in its settings cell to your data location.
-- `phase_pipeline_minimal.ipynb`: the same pipeline in a few short cells, using the
-  parameters from `settings.py`.
+- `phase_pipeline_minimal.ipynb`: the same pipeline for one subject in a few short
+  cells, with all parameters in its first cells (independent of `settings.py`).
 - `inspect_intake_metadata.py`: prints intake metadata columns and values, useful
   for confirming which column contains the BOSS positive/negative labels.
 
