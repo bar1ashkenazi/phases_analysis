@@ -13,7 +13,7 @@ then phase/amplitude read out at the sample nearest t=0.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -90,19 +90,24 @@ class LoadConfig:
     hjorth_channel, hjorth_weights, hjorth_scale_reference
         Weighted Hjorth/Laplacian channel definition; it is rescaled to the std of
         ``hjorth_scale_reference``.
+
+    Only ``data_root`` is required; the defaults are the intake analysis settings
+    (Fz Hjorth channel, 100 Hz low-pass, resampling to 1000 Hz).
     """
 
     data_root: Path
-    intake_filename: str
-    channel: str
-    condition_column: str
-    condition_auto_keywords: tuple[str, ...]
-    lowpass_before_downsample_hz: float | None
-    downsample: bool
-    downsample_fs: float
-    hjorth_channel: str
-    hjorth_weights: dict[str, float]
-    hjorth_scale_reference: str
+    intake_filename: str = "{subject}_intake_stim-epo.fif"
+    channel: str = "Fz_hjorth"
+    condition_column: str = "Condition"
+    condition_auto_keywords: tuple[str, ...] = ("condition", "boss", "classification", "class")
+    lowpass_before_downsample_hz: float | None = 100.0
+    downsample: bool = True
+    downsample_fs: float = 1000.0
+    hjorth_channel: str = "Fz_hjorth"
+    hjorth_weights: dict[str, float] = field(
+        default_factory=lambda: {"Fz": 1, "AF3": -0.25, "AF4": -0.25, "FC1": -0.25, "FC2": -0.25}
+    )
+    hjorth_scale_reference: str = "Fz"
     labels: LabelScheme = DEFAULT_LABELS
     show_metadata_summary: bool = False
     metadata_max_values: int = 12
