@@ -2,7 +2,7 @@
 
 By default this compiles and imports the analysis code and runs synthetic-data tests
 (no EEG files needed). Use --with-data on a machine that has the NAS mounted to run a
-small real-data smoke test, and --notebook to execute the walkthrough notebook in
+small real-data smoke test, and --notebook to execute the notebook in
 DEMO mode (needs nbconvert + ipykernel).
 """
 
@@ -19,7 +19,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 NEW_CODE = PROJECT_ROOT / "new_code"
-NOTEBOOKS = [NEW_CODE / "phase_pipeline_walkthrough.ipynb", NEW_CODE / "phase_pipeline_minimal.ipynb"]
+NOTEBOOKS = [NEW_CODE / "phase_pipeline.ipynb"]
 if str(NEW_CODE) not in sys.path:
     sys.path.insert(0, str(NEW_CODE))
 if str(PROJECT_ROOT) not in sys.path:
@@ -149,7 +149,7 @@ def run_data_smoke(subject: str, n_epochs: int, causal_params_mode: str) -> None
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--with-data", action="store_true", help="Run a small real-data smoke test if data is mounted.")
-    parser.add_argument("--notebook", action="store_true", help="Execute the notebooks in DEMO mode.")
+    parser.add_argument("--notebook", action="store_true", help="Execute the notebook in DEMO mode.")
     parser.add_argument("--subject", default="sub_103")
     parser.add_argument("--n-epochs", type=int, default=2)
     parser.add_argument(

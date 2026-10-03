@@ -5,7 +5,7 @@
 - The active clean implementation is under `new_code/`.
 - Reusable logic belongs in `new_code/functions.py`.
 - Analysis parameters, subject choices, paths, and run modes belong in `new_code/settings.py`.
-- Runners, the HTML report and `new_code/phase_pipeline_walkthrough.ipynb` only call `functions.py`; no analysis math elsewhere (including the report JavaScript).
+- Runners, the HTML report and `new_code/phase_pipeline.ipynb` only call `functions.py`; no analysis math elsewhere (including the report JavaScript).
 
 ## Data
 - Real intake data is not stored in git.

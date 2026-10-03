@@ -19,11 +19,9 @@ Files:
   parameters and optimization ranges.
 - `run_intake_phase_html_report.py`: computes estimates once, caches them as JSON,
   and writes a self-contained interactive HTML report plus a publication figure.
-- `phase_pipeline_walkthrough.ipynb`: step-by-step notebook (load one epoch as a
-  NumPy array, each processing step with plots and parameter explanations, final
-  results). Update `DATA_ROOT` in its settings cell to your data location.
-- `phase_pipeline_minimal.ipynb`: the same pipeline for one subject in a few short
-  cells, with all parameters in its first cells (independent of `settings.py`).
+- `phase_pipeline.ipynb`: the pipeline for one subject, section by section (load,
+  one epoch step by step, optional optimization, BOSS success, figures). Each section
+  sets its own parameters; it does not read `settings.py`.
 - `inspect_intake_metadata.py`: prints intake metadata columns and values, useful
   for confirming which column contains the BOSS positive/negative labels.
 
@@ -59,17 +57,15 @@ Synthetic demo (no data needed): add `--demo --output-dir /tmp/intake_phase_repo
 
 ## Notebook
 
-```bash
-./.venv/bin/jupyter lab new_code/phase_pipeline_walkthrough.ipynb
-```
-
-In VS Code: open the notebook, choose the `.venv` kernel (Select Kernel, top right), Run All.
-Set `DEMO = True` in the first code cell to run on synthetic epochs.
+In VS Code: open `new_code/phase_pipeline.ipynb`, choose the `.venv` kernel (Select
+Kernel, top right), set `DATA_ROOT` and `SUBJECT` in section 1, then Run All. The data
+share must be mounted (VPN + Finder > Go > Connect to Server). Set `DEMO = True` to run
+on synthetic epochs without data.
 
 ## Checks
 
 ```bash
 ./.venv/bin/python scripts/check_new_code.py              # compile, imports, synthetic tests, demo report
-./.venv/bin/python scripts/check_new_code.py --notebook   # also execute both notebooks in DEMO mode
+./.venv/bin/python scripts/check_new_code.py --notebook   # also execute the notebook in DEMO mode
 ./.venv/bin/python scripts/check_new_code.py --with-data --subject sub_103 --n-epochs 2   # NAS mounted
 ```

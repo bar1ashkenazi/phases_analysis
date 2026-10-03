@@ -1,7 +1,7 @@
 """Reusable helpers for intake-session phase/BOSS comparison.
 
 This module is the single source of analysis logic. Runners, the HTML report and the
-walkthrough notebook only call these functions and render what they return.
+notebook (phase_pipeline.ipynb) only call these functions and render what they return.
 
 Terminology: an epoch is the EEG window cut around one stimulation event (one BOSS
 decision, t=0). A memory-task trial contains several such events; epochs are analyzed

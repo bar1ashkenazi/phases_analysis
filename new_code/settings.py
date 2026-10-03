@@ -1,8 +1,8 @@
 """Analysis parameters for the intake phase vs. BOSS comparison.
 
 Edit the CAPS settings below. They are used by ``run_intake_phase_html_report.py``,
-``inspect_intake_metadata.py`` and ``scripts/check_new_code.py``. The walkthrough
-notebook defines its own copy of these values so each one can be explained in place.
+``inspect_intake_metadata.py`` and ``scripts/check_new_code.py``. The notebook
+(``phase_pipeline.ipynb``) sets its own parameters in each section.
 """
 
 from pathlib import Path
