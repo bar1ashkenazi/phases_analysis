@@ -42,7 +42,7 @@ Run from the project root:
 Outputs are written to `new_code/intake_phase_report/`:
 
 - `intake_phase_results.json`: cached estimates and selected causal params.
-- `intake_phase_report.html`: phase circle, trial signals, deviation histograms
+- `intake_phase_report.html`: phase circle, epoch signals, deviation histograms
   (phase − BOSS target, causal − non-causal; per subject or pooled) and BOSS
   success vs tolerance.
 - `success_vs_tolerance.pdf` / `.png`: publication version of the success figure
@@ -71,5 +71,5 @@ Set `DEMO = True` in the first code cell to run on synthetic epochs.
 ```bash
 ./.venv/bin/python scripts/check_new_code.py              # compile, imports, synthetic tests, demo report
 ./.venv/bin/python scripts/check_new_code.py --notebook   # also execute both notebooks in DEMO mode
-./.venv/bin/python scripts/check_new_code.py --with-data --subject sub_103 --n-trials 2   # NAS mounted
+./.venv/bin/python scripts/check_new_code.py --with-data --subject sub_103 --n-epochs 2   # NAS mounted
 ```

@@ -5,7 +5,7 @@ walkthrough notebook only call these functions and render what they return.
 
 Terminology: an epoch is the EEG window cut around one stimulation event (one BOSS
 decision, t=0). A memory-task trial contains several such events; epochs are analyzed
-independently. Names like ``TrialEstimate`` / ``n_trials`` refer to epochs. An Optuna
+independently. An Optuna
 "trial" (``n_opt_trials``) is something else: one evaluated causal parameter set.
 
 The non-causal phase estimate intentionally follows the working logic in
@@ -346,7 +346,7 @@ class CausalEstimate:
 
 
 @dataclass
-class TrialEstimate:
+class EpochEstimate:
     subject: str
     epoch_index: int
     label: str
@@ -544,8 +544,8 @@ def resolve_noncausal_filter_order(
     return int(causal_params["filter_order"])
 
 
-def _limit_trials(X: np.ndarray, n_trials: int | bool) -> np.ndarray:
-    return X if not n_trials else X[:min(int(n_trials), len(X))]
+def _limit_epochs(X: np.ndarray, n_epochs: int | bool) -> np.ndarray:
+    return X if not n_epochs else X[:min(int(n_epochs), len(X))]
 
 
 def signed_angular_difference_deg(a_deg: float, b_deg: float) -> float:
@@ -553,19 +553,19 @@ def signed_angular_difference_deg(a_deg: float, b_deg: float) -> float:
     return float((a_deg - b_deg + 180.0) % 360.0 - 180.0)
 
 
-def estimate_subject_trials(
+def estimate_subject_epochs(
     data: EpochArrays,
     band: tuple[float, float],
     filter_order: int,
     cutoff_ms: float,
-    n_trials: int | bool,
+    n_epochs: int | bool,
     causal_params: dict[str, float | int] | None,
-) -> list[TrialEstimate]:
+) -> list[EpochEstimate]:
     """Non-causal (and optional causal) phase for every epoch of one subject.
 
     ``filter_order`` is the non-causal filter order; see ``resolve_noncausal_filter_order``.
     """
-    X = _limit_trials(data.X, n_trials)
+    X = _limit_epochs(data.X, n_epochs)
     noncausal_filter = bandpass_fir(data.fs, band, filter_order)
     causal_filter = None
     if causal_params is not None:
@@ -582,7 +582,7 @@ def estimate_subject_trials(
                 causal.phase_error_deg = signed_angular_difference_deg(causal.phase_deg, est["phase_deg"])
 
         estimates.append(
-            TrialEstimate(
+            EpochEstimate(
                 subject=data.subject,
                 epoch_index=i,
                 label=label,
@@ -605,12 +605,12 @@ def estimate_all_subjects(
     band: tuple[float, float],
     filter_order: int,
     cutoff_ms: float,
-    n_trials: int | bool,
+    n_epochs: int | bool,
     causal_estimation: bool,
     causal_params_mode: str,
     manual_causal_params: dict[str, float | int],
     optimization_config: dict,
-) -> dict[str, list[TrialEstimate]]:
+) -> dict[str, list[EpochEstimate]]:
     """Estimate phases for each subject.
 
     ``causal_params_mode``: ``"manual"`` uses ``manual_causal_params`` for everyone;
@@ -630,18 +630,18 @@ def estimate_all_subjects(
                     band=band,
                     cutoff_ms=cutoff_ms,
                     optimization_config=optimization_config,
-                    n_trials=n_trials,
+                    n_epochs=n_epochs,
                     name=data.subject,
                 )
             else:
                 raise ValueError("causal_params_mode must be 'manual' or 'optimize'.")
 
-        estimates_by_subject[data.subject] = estimate_subject_trials(
+        estimates_by_subject[data.subject] = estimate_subject_epochs(
             data,
             band=band,
             filter_order=resolve_noncausal_filter_order(causal_params, filter_order),
             cutoff_ms=cutoff_ms,
-            n_trials=n_trials,
+            n_epochs=n_epochs,
             causal_params=causal_params,
         )
     return estimates_by_subject
@@ -661,7 +661,7 @@ def _evaluate_causal_params(
     band: tuple[float, float],
     cutoff_ms: float,
     params: dict[str, float | int],
-    min_usable_trials: int,
+    min_usable_epochs: int,
 ) -> dict | None:
     params = validate_causal_params(params)
     cutoff = cutoff_index(times_ms, cutoff_ms)
@@ -687,7 +687,7 @@ def _evaluate_causal_params(
             continue
         errors_rad.append(causal.phase_rad - noncausal["phase_rad"])
 
-    if len(errors_rad) < min_usable_trials:
+    if len(errors_rad) < min_usable_epochs:
         return None
 
     circ_var = _circular_variance(errors_rad)
@@ -737,7 +737,7 @@ def _make_causal_optimization_objective(
             band,
             cutoff_ms,
             params,
-            min_usable_trials=optimization_config["min_usable_trials"],
+            min_usable_epochs=optimization_config["min_usable_epochs"],
         )
         if result is None:
             return optimization_config["infeasible_penalty"]
@@ -753,7 +753,7 @@ def optimize_causal_params(
     band: tuple[float, float],
     cutoff_ms: float,
     optimization_config: dict,
-    n_trials: int | bool = False,
+    n_epochs: int | bool = False,
     name: str = "data",
 ) -> dict[str, float | int]:
     """Choose one causal AR parameter set against the non-causal phase (Optuna TPE).
@@ -769,9 +769,9 @@ def optimize_causal_params(
         raise ImportError("Optimization mode requires optuna. Install the project requirements first.") from exc
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    X = _limit_trials(X, n_trials)
+    X = _limit_epochs(X, n_epochs)
     if len(X) == 0:
-        raise ValueError(f"No trials available for {name}.")
+        raise ValueError(f"No epochs available for {name}.")
 
     rng = np.random.default_rng(int(optimization_config["random_seed"]))
     shuffled = rng.permutation(len(X))
@@ -808,7 +808,7 @@ def optimize_causal_params(
         band,
         cutoff_ms,
         best_params,
-        min_usable_trials=optimization_config["min_usable_trials"],
+        min_usable_epochs=optimization_config["min_usable_epochs"],
     )
     if train_result is None:
         raise RuntimeError(f"No feasible causal AR parameters found for {name}.")
@@ -816,7 +816,7 @@ def optimize_causal_params(
     test_result = None
     if len(test_idx):
         test_result = _evaluate_causal_params(
-            X, test_idx, times_ms, fs, band, cutoff_ms, best_params, min_usable_trials=1
+            X, test_idx, times_ms, fs, band, cutoff_ms, best_params, min_usable_epochs=1
         )
 
     print(f"\n[{name}] optimized causal AR params: {best_params}")
@@ -1082,7 +1082,7 @@ def analyze_phase_results(
     return out
 
 
-def estimates_to_arrays(estimates: Sequence[TrialEstimate]) -> dict[str, list]:
+def estimates_to_arrays(estimates: Sequence[EpochEstimate]) -> dict[str, list]:
     """Per-epoch sequences in the shape ``analyze_phase_results`` expects."""
     return {
         "boss": [est.label for est in estimates],
@@ -1094,8 +1094,8 @@ def estimates_to_arrays(estimates: Sequence[TrialEstimate]) -> dict[str, list]:
 
 # ---- Static figures (notebook + publication export) ---------------------
 
-def plot_trial_signal(
-    estimate: TrialEstimate,
+def plot_epoch_signal(
+    estimate: EpochEstimate,
     cutoff_ms: float,
     band: tuple[float, float],
     window_ms: tuple[float, float] | None = None,
@@ -1130,7 +1130,7 @@ def plot_trial_signal(
     if causal is not None:
         ax.plot([], [], " ", label=f"causal: {causal.phase_deg:.1f} deg")
         ax.plot([], [], " ", label=f"causal - non-causal: {causal.phase_error_deg:+.1f} deg")
-    ax.set_title(f"{estimate.subject} trial {estimate.epoch_index + 1}")
+    ax.set_title(f"{estimate.subject} epoch {estimate.epoch_index + 1}")
     ax.set_xlabel("Time (ms)")
     ax.set_ylabel("Amplitude")
     ax.legend(loc="upper left", fontsize=8)
@@ -1335,7 +1335,7 @@ def plot_success_vs_tolerance(
     ax.set_xlim(-0.6, len(tolerances) - 0.4)
     ax.set_ylim(0, 100)
     ax.set_xlabel("Tolerance (deg)")
-    ax.set_ylabel("BOSS success (% of labeled trials)")
+    ax.set_ylabel("BOSS success (% of labeled epochs)")
     ax.set_title(f"BOSS phase accuracy (non-causal, n={n_subjects} subjects)", fontsize=10)
     ax.spines[["top", "right"]].set_visible(False)
     ax.legend(fontsize=8, loc="upper right", frameon=False)

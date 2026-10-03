@@ -91,7 +91,7 @@ def estimate_snr(signal, fs, band, fit_ranges, bandwidth, return_fit=False):
     `band` can hold as few as 1-2 bins, too few for a strict local-max-with-prominence peak
     shape to ever form even when the band genuinely sits above the 1/f background. Taking
     the band max instead guarantees a real (possibly low or negative dB) value for every
-    call; a trial with no true oscillation shows up as a low/negative snr_db rather than
+    call; an epoch with no true oscillation shows up as a low/negative snr_db rather than
     silently vanishing as nan -- filter on that downstream if a threshold is wanted.
 
     Returns (peak_frequency_hz, snr_db) or, with return_fit, (peak_frequency_hz, snr_db,

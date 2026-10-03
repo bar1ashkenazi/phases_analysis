@@ -19,7 +19,7 @@
 - Basic no-data check:
   `./.venv/bin/python scripts/check_new_code.py`
 - Optional data smoke check, when the NAS is mounted:
-  `./.venv/bin/python scripts/check_new_code.py --with-data --subject sub_103 --n-trials 2`
+  `./.venv/bin/python scripts/check_new_code.py --with-data --subject sub_103 --n-epochs 2`
 
 ## Constraints
 - Do not commit `.venv`, caches, generated figures, or raw EEG files.

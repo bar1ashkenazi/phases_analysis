@@ -36,7 +36,7 @@ def compile_sources() -> None:
         PROJECT_ROOT / "pipeline.py",
         PROJECT_ROOT / "causal_vs_boss.py",
         PROJECT_ROOT / "run.py",
-        PROJECT_ROOT / "visualize_trials.py",
+        PROJECT_ROOT / "visualize_epochs.py",
         NEW_CODE,
     ]
     for path in paths:
@@ -64,7 +64,7 @@ def run_synthetic_tests() -> None:
         band=s.BAND,
         filter_order=s.FILTER_ORDER,
         cutoff_ms=s.CUTOFF_MS,
-        n_trials=False,
+        n_epochs=False,
         causal_estimation=True,
         causal_params_mode="manual",
         manual_causal_params=s.MANUAL_CAUSAL_PARAMS,
@@ -120,7 +120,7 @@ def run_notebook_demo() -> None:
             )
 
 
-def run_data_smoke(subject: str, n_trials: int, causal_params_mode: str) -> None:
+def run_data_smoke(subject: str, n_epochs: int, causal_params_mode: str) -> None:
     import settings as s
     from functions import estimate_all_subjects, get_data
 
@@ -133,17 +133,17 @@ def run_data_smoke(subject: str, n_trials: int, causal_params_mode: str) -> None
         band=s.BAND,
         filter_order=s.FILTER_ORDER,
         cutoff_ms=s.CUTOFF_MS,
-        n_trials=n_trials,
+        n_epochs=n_epochs,
         causal_estimation=s.CAUSAL_ESTIMATION,
         causal_params_mode=causal_params_mode,
         manual_causal_params=s.MANUAL_CAUSAL_PARAMS,
         optimization_config=s.CAUSAL_OPTIMIZATION_CONFIG,
     )
-    trial_estimates = estimates[subject]
-    if len(trial_estimates) != n_trials:
-        raise RuntimeError(f"Expected {n_trials} estimates for {subject}, got {len(trial_estimates)}")
-    if s.CAUSAL_ESTIMATION and not all(est.causal is not None for est in trial_estimates):
-        raise RuntimeError("Causal estimation is enabled but at least one trial has no causal phase.")
+    epoch_estimates = estimates[subject]
+    if len(epoch_estimates) != n_epochs:
+        raise RuntimeError(f"Expected {n_epochs} estimates for {subject}, got {len(epoch_estimates)}")
+    if s.CAUSAL_ESTIMATION and not all(est.causal is not None for est in epoch_estimates):
+        raise RuntimeError("Causal estimation is enabled but at least one epoch has no causal phase.")
 
 
 def main() -> None:
@@ -151,7 +151,7 @@ def main() -> None:
     parser.add_argument("--with-data", action="store_true", help="Run a small real-data smoke test if data is mounted.")
     parser.add_argument("--notebook", action="store_true", help="Execute the notebooks in DEMO mode.")
     parser.add_argument("--subject", default="sub_103")
-    parser.add_argument("--n-trials", type=int, default=2)
+    parser.add_argument("--n-epochs", type=int, default=2)
     parser.add_argument(
         "--causal-params-mode",
         choices=("manual", "optimize"),
@@ -167,7 +167,7 @@ def main() -> None:
     if args.notebook:
         run_notebook_demo()
     if args.with_data:
-        run_data_smoke(args.subject, args.n_trials, args.causal_params_mode)
+        run_data_smoke(args.subject, args.n_epochs, args.causal_params_mode)
     print("checks ok")
 
 

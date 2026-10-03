@@ -2,8 +2,8 @@
 
 CALCULATION options:
   "deviation_snr_signal" -- causal (AR-forecast) vs non-causal (filtfilt) phase estimate
-        at the cutoff, over N_TRIALS epochs -> scatter of |phase error| (deg) vs band SNR
-        (dB), one point per epoch. Click a point to open that trial's signal plot (raw /
+        at the cutoff, over N_EPOCHS epochs -> scatter of |phase error| (deg) vs band SNR
+        (dB), one point per epoch. Click a point to open that epoch's signal plot (raw /
         causal AR-forecast / non-causal ground-truth overlay -- formerly "step 1") plus its
         SNR-window spectrum (log-log, 1/f fit line + R², peak frequency, SNR).
   "phase_metadata" -- one phase estimate per epoch at t=0 -> new column on epochs.metadata.
@@ -63,7 +63,7 @@ WINDOW_MS = 510.0              # length of the window feeding the AR predictor
 
 # ---- deviation_snr_signal: causal-vs-non-causal phase estimate at the cutoff ----
 CUTOFF_MS = 0.0                 # split point: AR core before, AR-predicted after
-N_TRIALS = False                # limit to the first N trials; False = use all
+N_EPOCHS = False                # limit to the first N epochs; False = use all
 
 # what to plot |phase error| against (x-axis of the scatter):
 #   "snr"         band SNR (dB), windowed 1/f-corrected spectral estimate (original metric)
@@ -128,7 +128,7 @@ METADATA_COLUMN = "phase_deg"
 OPT_N_TRIALS = 200              # number of Optuna trials (param combos tried)
 OPT_TRAIN_FRACTION = 0.8        # fraction of epochs used to fit; rest held out to check generalization
 OPT_RANDOM_SEED = 0
-OPT_MIN_TRIALS = 20             # penalize a param combo if fewer than this many epochs are usable
+OPT_MIN_EPOCHS = 20             # penalize a param combo if fewer than this many epochs are usable
 
 OPT_WINDOW_MS_RANGE = (300, 950)
 OPT_WINDOW_MS_STEP = 10
@@ -199,7 +199,7 @@ def _cutoff_estimate(x, times_ms, fs, b, cutoff, win):
     core_times_ms = times_ms[cutoff - win:cutoff][EDGE:-EDGE]
     future_t = core_times_ms[-1] + (np.arange(1, len(pred_future) + 1)) / fs * 1000
 
-    # non-causal (offline, zero-phase) ground truth over the whole trial, evaluated
+    # non-causal (offline, zero-phase) ground truth over the whole epoch, evaluated
     # at CUTOFF_MS so it's directly comparable to the causal phastimate() estimate.
     real_filtered = filtfilt(b, 1.0, x - x.mean())
     real_analytic = hilbert(real_filtered)
@@ -215,8 +215,8 @@ def _cutoff_estimate(x, times_ms, fs, b, cutoff, win):
     )
 
 
-def _plot_trial(i, n, x, times_ms, est):
-    """Per-trial signal overlay: raw / causal (AR-forecast) / non-causal (filtfilt) ground truth."""
+def _plot_epoch(i, n, x, times_ms, est):
+    """Per-epoch signal overlay: raw / causal (AR-forecast) / non-causal (filtfilt) ground truth."""
     fig, ax = plt.subplots(figsize=(9, 4))
     ax.plot(times_ms, x, color="black", lw=1, label=f"raw ({CHANNEL})")
     ax.plot(times_ms, est["real_filtered"], color="tab:blue", lw=1, alpha=0.7,
@@ -235,7 +235,7 @@ def _plot_trial(i, n, x, times_ms, est):
     ax.plot([], [], " ", label=f"non-causal phase @ t=0: {noncausal_phase_deg:.1f}°")
     ax.plot([], [], " ", label=f"Δphase (causal − non-causal): {est['phase_error_deg']:+.1f}°")
     ax.set_title(
-        f"Trial {i + 1}/{n}  |  causal vs non-causal @ cutoff: "
+        f"Epoch {i + 1}/{n}  |  causal vs non-causal @ cutoff: "
         f"Δphase={est['phase_error_deg']:+.1f}°, amp ratio={est['amp_ratio']:.2f}"
     )
     ax.set_xlabel("Time (ms)")
@@ -243,13 +243,13 @@ def _plot_trial(i, n, x, times_ms, est):
     fig.tight_layout()
 
     if SAVE:
-        Path("trial_plots").mkdir(exist_ok=True)
-        fig.savefig(f"trial_plots/trial_{i + 1:03d}.png", dpi=150)
+        Path("epoch_plots").mkdir(exist_ok=True)
+        fig.savefig(f"epoch_plots/epoch_{i + 1:03d}.png", dpi=150)
     return fig
 
 
 def _plot_spectrum(i, n, peak_freq, snr_db, fit_info):
-    """Log-log (semilogx, dB) spectrum for one trial's SNR window: the 1/f fit line,
+    """Log-log (semilogx, dB) spectrum for one epoch's SNR window: the 1/f fit line,
     which points fed it, and the detected peak -- for sanity-checking estimate_snr()."""
     f, log_p = fit_info["f"], fit_info["log_p"]
     slope, intercept, r2, fit_mask = fit_info["slope"], fit_info["intercept"], fit_info["r2"], fit_info["fit_mask"]
@@ -267,13 +267,13 @@ def _plot_spectrum(i, n, peak_freq, snr_db, fit_info):
         ax.plot([], [], " ", label="band outside evaluated 2-45 Hz range")
     ax.set_xlabel("frequency (Hz)")
     ax.set_ylabel("power (dB)")
-    ax.set_title(f"Trial {i + 1}/{n} spectrum (SNR window)")
+    ax.set_title(f"Epoch {i + 1}/{n} spectrum (SNR window)")
     ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
 
     if SAVE:
-        Path("trial_plots").mkdir(exist_ok=True)
-        fig.savefig(f"trial_plots/trial_{i + 1:03d}_spectrum.png", dpi=150)
+        Path("epoch_plots").mkdir(exist_ok=True)
+        fig.savefig(f"epoch_plots/epoch_{i + 1:03d}_spectrum.png", dpi=150)
     return fig
 
 
@@ -285,18 +285,18 @@ _X_AXIS_LABELS = {
 
 
 def _deviation_snr_signal_one(subject, fs, data, times_ms):
-    """Compute causal-vs-non-causal phase error + band SNR + both amplitudes per trial.
+    """Compute causal-vs-non-causal phase error + band SNR + both amplitudes per epoch.
 
-    Returns (x_values, abs_errors_deg, trials) where x_values is whichever quantity
-    X_AXIS selects, and `trials` holds the per-point data needed for click-through
-    (trial_index, x, est, peak_freq, snr_db, fit_info, n)."""
+    Returns (x_values, abs_errors_deg, epoch_points) where x_values is whichever quantity
+    X_AXIS selects, and `epoch_points` holds the per-point data needed for click-through
+    (epoch_index, x, est, peak_freq, snr_db, fit_info, n)."""
     b = design_bandpass(FILTER_ORDER, BAND[0], BAND[1], fs)
-    n = N_TRIALS or len(data)
+    n = N_EPOCHS or len(data)
     cutoff = int(np.argmin(np.abs(times_ms - CUTOFF_MS)))
     win = round(PRE_CUTOFF_WINDOW_MS / 1000 * fs)
     snr_win = round(SNR_WINDOW_MS / 1000 * fs)
 
-    trials = []
+    epoch_points = []
     phase_errors_deg, amp_ratios, abs_errors_deg = [], [], []
     snr_db, amp_true, amp_causal = [], [], []
     for i, x in enumerate(data[:n]):
@@ -315,17 +315,17 @@ def _deviation_snr_signal_one(subject, fs, data, times_ms):
         snr_db.append(peak_snr_db)
         amp_true.append(est["real_amplitude"])
         amp_causal.append(est["amplitude"])
-        trials.append((i, x, est, peak_freq, peak_snr_db, fit_info, n))
+        epoch_points.append((i, x, est, peak_freq, peak_snr_db, fit_info, n))
 
     if phase_errors_deg:
         print(
-            f"[{subject}] causal vs non-causal @ cutoff (n={len(phase_errors_deg)}/{n} trials): "
+            f"[{subject}] causal vs non-causal @ cutoff (n={len(phase_errors_deg)}/{n} epochs): "
             f"phase error {np.mean(phase_errors_deg):+.1f}° ± {np.std(phase_errors_deg):.1f}°, "
             f"amp ratio {np.mean(amp_ratios):.2f} ± {np.std(amp_ratios):.2f}"
         )
 
     x_values = {"snr": snr_db, "amp_true": amp_true, "amp_causal": amp_causal}[X_AXIS]
-    return x_values, abs_errors_deg, trials
+    return x_values, abs_errors_deg, epoch_points
 
 
 def deviation_snr_signal(subject_data):
@@ -335,22 +335,22 @@ def deviation_snr_signal(subject_data):
     color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
     scatters = []       # per-subject scatter artists, for click-through lookup
-    trials_by_subject = []
+    epoch_points_by_subject = []
     times_ms_by_subject = []
     total_points = 0
     for idx, (subject, fs, data, times_ms) in enumerate(subject_data):
-        x_values, abs_errors_deg, trials = _deviation_snr_signal_one(subject, fs, data, times_ms)
+        x_values, abs_errors_deg, epoch_points = _deviation_snr_signal_one(subject, fs, data, times_ms)
         color = color_cycle[idx % len(color_cycle)]
         scatter = ax.scatter(x_values, abs_errors_deg, s=25, alpha=0.7, color=color,
                               label=subject, picker=True, pickradius=6)
         scatters.append(scatter)
-        trials_by_subject.append(trials)
+        epoch_points_by_subject.append(epoch_points)
         times_ms_by_subject.append(times_ms)
         total_points += len(abs_errors_deg)
 
     ax.set_xlabel(_X_AXIS_LABELS[X_AXIS])
     ax.set_ylabel("|Δphase| (causal − non-causal, deg)")
-    title = f"Phase error vs. {_X_AXIS_LABELS[X_AXIS]} (n={total_points} trials) -- click a point for its signal + spectrum plots"
+    title = f"Phase error vs. {_X_AXIS_LABELS[X_AXIS]} (n={total_points} epochs) -- click a point for its signal + spectrum plots"
     if len(subject_data) > 1:
         ax.legend(loc="best", fontsize=8, title="subject")
     ax.set_title(title)
@@ -360,10 +360,10 @@ def deviation_snr_signal(subject_data):
         if event.artist not in scatters or not len(event.ind):
             return
         subj_idx = scatters.index(event.artist)
-        trials = trials_by_subject[subj_idx]
+        epoch_points = epoch_points_by_subject[subj_idx]
         times_ms = times_ms_by_subject[subj_idx]
-        i, x, est, peak_freq, peak_snr_db, fit_info, n = trials[event.ind[0]]
-        _plot_trial(i, n, x, times_ms, est).show()
+        i, x, est, peak_freq, peak_snr_db, fit_info, n = epoch_points[event.ind[0]]
+        _plot_epoch(i, n, x, times_ms, est).show()
         _plot_spectrum(i, n, peak_freq, peak_snr_db, fit_info).show()
 
     fig.canvas.mpl_connect("pick_event", on_pick)
@@ -440,7 +440,7 @@ def _evaluate_params(data, indices, cutoff, fs, window_ms, filter_order, edge, a
             continue
         if e is not None:
             errors.append(e)
-    if len(errors) < OPT_MIN_TRIALS:
+    if len(errors) < OPT_MIN_EPOCHS:
         return None
     return _circular_variance(errors), len(errors)
 

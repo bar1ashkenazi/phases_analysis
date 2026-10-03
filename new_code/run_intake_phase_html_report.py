@@ -58,7 +58,7 @@ import settings
 from functions import (
     CLASS_COLORS,
     METHOD_COLORS,
-    TrialEstimate,
+    EpochEstimate,
     analyze_phase_results,
     estimate_all_subjects,
     get_data,
@@ -95,7 +95,7 @@ def main() -> None:
         save_json(cache_path, payload)
         cache_written = True
     elif args.from_cache or (cache_path.exists() and not args.force):
-        payload = load_json(cache_path)
+        payload = upgrade_cached_payload(load_json(cache_path))
         print(f"Loaded cached results: {cache_path}")
     else:
         payload = compute_payload(args)
@@ -142,10 +142,10 @@ def parse_args() -> argparse.Namespace:
         help="Optional subject list. Defaults to SUBJECTS in settings.py.",
     )
     parser.add_argument(
-        "--n-trials",
+        "--n-epochs",
         type=int,
         default=None,
-        help="Optional epoch cap per subject for fast local smoke runs. Defaults to N_TRIALS in settings.py.",
+        help="Optional epoch cap per subject for fast local smoke runs. Defaults to N_EPOCHS in settings.py.",
     )
     parser.add_argument(
         "--n-opt-trials",
@@ -158,7 +158,7 @@ def parse_args() -> argparse.Namespace:
 
 def compute_payload(args: argparse.Namespace) -> dict[str, Any]:
     subjects = args.subjects if args.subjects is not None else settings.SUBJECTS
-    n_trials = args.n_trials if args.n_trials is not None else settings.N_TRIALS
+    n_epochs = args.n_epochs if args.n_epochs is not None else settings.N_EPOCHS
     optimization_config = dict(settings.CAUSAL_OPTIMIZATION_CONFIG)
     if args.n_opt_trials is not None:
         optimization_config["n_opt_trials"] = args.n_opt_trials
@@ -172,7 +172,7 @@ def compute_payload(args: argparse.Namespace) -> dict[str, Any]:
         band=settings.BAND,
         filter_order=settings.FILTER_ORDER,
         cutoff_ms=settings.CUTOFF_MS,
-        n_trials=n_trials,
+        n_epochs=n_epochs,
         causal_estimation=settings.CAUSAL_ESTIMATION,
         causal_params_mode=settings.CAUSAL_PARAMS_MODE,
         manual_causal_params=settings.MANUAL_CAUSAL_PARAMS,
@@ -180,7 +180,7 @@ def compute_payload(args: argparse.Namespace) -> dict[str, Any]:
     )
     return estimates_to_payload(
         estimates_by_subject,
-        n_trials=n_trials,
+        n_epochs=n_epochs,
         optimization_config=optimization_config,
         causal_params_mode=settings.CAUSAL_PARAMS_MODE,
         data_root=str(settings.DATA_ROOT),
@@ -188,35 +188,35 @@ def compute_payload(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def estimates_to_payload(
-    estimates_by_subject: dict[str, list[TrialEstimate]],
-    n_trials: int | bool,
+    estimates_by_subject: dict[str, list[EpochEstimate]],
+    n_epochs: int | bool,
     optimization_config: dict[str, Any],
     causal_params_mode: str,
     data_root: str,
 ) -> dict[str, Any]:
     subject_payloads = []
-    total_trials = 0
+    total_epochs = 0
     causal_available = False
 
     for subject, estimates in estimates_by_subject.items():
-        trials = [trial_to_payload(est) for est in estimates]
-        total_trials += len(trials)
-        subject_causal_available = any(trial["causal_phase_deg"] is not None for trial in trials)
+        epochs = [epoch_to_payload(est) for est in estimates]
+        total_epochs += len(epochs)
+        subject_causal_available = any(epoch["causal_phase_deg"] is not None for epoch in epochs)
         causal_available = causal_available or subject_causal_available
         subject_payloads.append(
             {
                 "id": subject,
-                "n_trials": len(trials),
+                "n_epochs": len(epochs),
                 "channel": estimates[0].channel if estimates else settings.CHANNEL,
                 "causal_available": subject_causal_available,
                 "causal_params": first_causal_params(estimates),
                 "noncausal_filter_order": estimates[0].noncausal_filter_order if estimates else None,
-                "trials": trials,
+                "epochs": epochs,
             }
         )
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "settings": {
             "subjects": list(estimates_by_subject.keys()),
@@ -226,7 +226,7 @@ def estimates_to_payload(
             "band_hz": list(settings.BAND),
             "filter_order": settings.FILTER_ORDER,
             "cutoff_ms": settings.CUTOFF_MS,
-            "n_trials": n_trials,
+            "n_epochs": n_epochs,
             "causal_estimation": settings.CAUSAL_ESTIMATION,
             "causal_params_mode": causal_params_mode,
             "optimization_config": json_safe(optimization_config),
@@ -247,16 +247,16 @@ def estimates_to_payload(
         "class_order": list(settings.LABELS.class_order),
         "max_signal_points": MAX_SIGNAL_POINTS,
         "causal_available": causal_available,
-        "total_trials": total_trials,
+        "total_epochs": total_epochs,
         "subjects": subject_payloads,
     }
 
 
-def trial_to_payload(est: TrialEstimate) -> dict[str, Any]:
+def epoch_to_payload(est: EpochEstimate) -> dict[str, Any]:
     signal_idx = decimation_indices(len(est.times_ms), MAX_SIGNAL_POINTS)
     causal = est.causal
     return {
-        "trial_id": f"{est.subject}:{est.epoch_index}",
+        "epoch_id": f"{est.subject}:{est.epoch_index}",
         "subject": est.subject,
         "epoch_index": est.epoch_index,
         "boss_class": est.label,
@@ -277,7 +277,7 @@ def trial_to_payload(est: TrialEstimate) -> dict[str, Any]:
     }
 
 
-def first_causal_params(estimates: Sequence[TrialEstimate]) -> dict[str, Any] | None:
+def first_causal_params(estimates: Sequence[EpochEstimate]) -> dict[str, Any] | None:
     for est in estimates:
         if est.causal is not None:
             return json_safe(est.causal.params)
@@ -304,10 +304,10 @@ def prepare_report(payload: dict[str, Any]) -> dict[str, Any]:
     report["analysis"] = json_safe(analyze_phase_results(
         {
             subject["id"]: {
-                "boss": [trial["boss_class"] for trial in subject["trials"]],
-                "noncausal_deg": [trial["phase_deg"] for trial in subject["trials"]],
-                "causal_deg": [trial["causal_phase_deg"] for trial in subject["trials"]],
-                "causal_error_deg": [trial["causal_phase_error_deg"] for trial in subject["trials"]],
+                "boss": [epoch["boss_class"] for epoch in subject["epochs"]],
+                "noncausal_deg": [epoch["phase_deg"] for epoch in subject["epochs"]],
+                "causal_deg": [epoch["causal_phase_deg"] for epoch in subject["epochs"]],
+                "causal_error_deg": [epoch["causal_phase_error_deg"] for epoch in subject["epochs"]],
             }
             for subject in subjects
         },
@@ -390,6 +390,27 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def upgrade_cached_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Rename schema-1 cache keys (which called epochs "trials") to the current names."""
+    if payload.get("schema_version", 1) >= 2:
+        return payload
+    renames = {"trials": "epochs", "n_trials": "n_epochs", "total_trials": "total_epochs"}
+    payload = {renames.get(k, k): v for k, v in payload.items()}
+    payload["settings"] = {renames.get(k, k): v for k, v in payload["settings"].items()}
+    payload["subjects"] = [
+        {
+            **{renames.get(k, k): v for k, v in subject.items()},
+            "epochs": [
+                {("epoch_id" if k == "trial_id" else k): v for k, v in epoch.items()}
+                for epoch in subject.get("epochs", subject.get("trials", []))
+            ],
+        }
+        for subject in payload["subjects"]
+    ]
+    payload["schema_version"] = 2
+    return payload
+
+
 def make_demo_payload() -> dict[str, Any]:
     """Synthetic epochs for several fake subjects, run through the real estimation pipeline."""
     subject_data = [
@@ -407,7 +428,7 @@ def make_demo_payload() -> dict[str, Any]:
         band=settings.BAND,
         filter_order=settings.FILTER_ORDER,
         cutoff_ms=settings.CUTOFF_MS,
-        n_trials=False,
+        n_epochs=False,
         causal_estimation=True,
         causal_params_mode="manual",
         manual_causal_params=settings.MANUAL_CAUSAL_PARAMS,
@@ -415,7 +436,7 @@ def make_demo_payload() -> dict[str, Any]:
     )
     payload = estimates_to_payload(
         estimates_by_subject,
-        n_trials=False,
+        n_epochs=False,
         optimization_config=settings.CAUSAL_OPTIMIZATION_CONFIG,
         causal_params_mode="manual",
         data_root="synthetic demo",
@@ -901,11 +922,11 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     <section class="signal-section">
       <div class="signal-head">
-        <h2 id="signalTitle">Trial signal</h2>
+        <h2 id="signalTitle">Epoch signal</h2>
         <p class="subtle" id="signalMeta"></p>
       </div>
       <div class="signal-wrap">
-        <svg id="signalSvg" viewBox="0 0 1080 380" role="img" aria-label="Selected trial signal"></svg>
+        <svg id="signalSvg" viewBox="0 0 1080 380" role="img" aria-label="Selected epoch signal"></svg>
       </div>
     </section>
 
@@ -930,7 +951,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         </div>
         <div>
           <table class="success-table" id="deviationStats"></table>
-          <p class="stats-line">Wedges: trials per 10° bin, stacked by BOSS class; 0° (no deviation) at the top, positive deviations clockwise. Arrows: mean resultant vector per BOSS class; direction = circular mean (bias), length = R (1 = all deviations identical, reaching the outer circle). Separate arrows keep opposite biases of positive and negative trials from cancelling out. Shaded: ±tolerance.</p>
+          <p class="stats-line">Wedges: epochs per 10° bin, stacked by BOSS class; 0° (no deviation) at the top, positive deviations clockwise. Arrows: mean resultant vector per BOSS class; direction = circular mean (bias), length = R (1 = all deviations identical, reaching the outer circle). Separate arrows keep opposite biases of positive and negative epochs from cancelling out. Shaded: ±tolerance.</p>
         </div>
       </div>
     </section>
@@ -978,12 +999,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       subjectId: report.subjects[0]?.id || "",
       tolerance: report.default_tolerance_deg || 30,
       phaseMode: "noncausal",
-      selectedTrialId: null,
+      selectedEpochId: null,
       deviationKind: "boss_target",
       deviationSubject: "",
       highlightSubject: null
     };
-    report.subjects.forEach(subject => subject.trials.forEach((trial, index) => { trial._index = index; }));
+    report.subjects.forEach(subject => subject.epochs.forEach((epoch, index) => { epoch._index = index; }));
 
     const subjectSelect = document.getElementById("subjectSelect");
     const toleranceButtons = document.getElementById("toleranceButtons");
@@ -1033,24 +1054,24 @@ HTML_TEMPLATE = r"""<!doctype html>
       return analysis.subjects[currentSubject()?.id] || null;
     }
 
-    function currentTrials() {
-      return currentSubject()?.trials || [];
+    function currentEpochs() {
+      return currentSubject()?.epochs || [];
     }
 
-    function trialById(trialId) {
-      return currentTrials().find(trial => trial.trial_id === trialId);
+    function epochById(epochId) {
+      return currentEpochs().find(epoch => epoch.epoch_id === epochId);
     }
 
-    function ensureSelectedTrial() {
-      const trials = currentTrials();
-      if (!trials.length) {
-        state.selectedTrialId = null;
+    function ensureSelectedEpoch() {
+      const epochs = currentEpochs();
+      if (!epochs.length) {
+        state.selectedEpochId = null;
         return null;
       }
-      const current = trialById(state.selectedTrialId);
+      const current = epochById(state.selectedEpochId);
       if (current) return current;
-      state.selectedTrialId = trials[0].trial_id;
-      return trials[0];
+      state.selectedEpochId = epochs[0].epoch_id;
+      return epochs[0];
     }
 
     function phaseModeMethods() {
@@ -1062,20 +1083,20 @@ HTML_TEMPLATE = r"""<!doctype html>
       return method === "causal" ? "Causal" : "Non-causal";
     }
 
-    function hasCausal(trial) {
-      return trial?.causal_phase_deg !== null && trial?.causal_phase_deg !== undefined;
+    function hasCausal(epoch) {
+      return epoch?.causal_phase_deg !== null && epoch?.causal_phase_deg !== undefined;
     }
 
-    function methodClass(trial, method) {
-      return currentAnalysis()?.classes[method][tolKey()][trial._index] ?? null;
+    function methodClass(epoch, method) {
+      return currentAnalysis()?.classes[method][tolKey()][epoch._index] ?? null;
     }
 
-    function methodPhase(trial, method) {
-      return method === "causal" ? trial.causal_phase_deg : trial.phase_deg;
+    function methodPhase(epoch, method) {
+      return method === "causal" ? epoch.causal_phase_deg : epoch.phase_deg;
     }
 
-    function comparisonStatus(trial, method) {
-      return currentAnalysis()?.status[method][tolKey()][trial._index] ?? "unknown";
+    function comparisonStatus(epoch, method) {
+      return currentAnalysis()?.status[method][tolKey()][epoch._index] ?? "unknown";
     }
 
     function polarPoint(cx, cy, radius, phaseDeg) {
@@ -1147,9 +1168,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       });
     }
 
-    function pointAttrs(trial, method) {
-      const status = comparisonStatus(trial, method);
-      const base = colors[trial.boss_class] || colors[UNKNOWN] || "#858b93";
+    function pointAttrs(epoch, method) {
+      const status = comparisonStatus(epoch, method);
+      const base = colors[epoch.boss_class] || colors[UNKNOWN] || "#858b93";
       if (status === "wrong") {
         return { fill: "#ffffff", stroke: base, "stroke-width": "2.2", opacity: "0.98" };
       }
@@ -1162,11 +1183,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       return { fill: base, stroke: "#ffffff", "stroke-width": "1", opacity: "0.88" };
     }
 
-    function addPoint(svg, trial, method, x, y) {
+    function addPoint(svg, epoch, method, x, y) {
       const attrs = {
-        ...pointAttrs(trial, method),
+        ...pointAttrs(epoch, method),
         class: "point",
-        "data-trial-id": trial.trial_id,
+        "data-epoch-id": epoch.epoch_id,
         tabindex: "0"
       };
       let node;
@@ -1181,22 +1202,22 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       const title = el("title");
       const label = method === "causal" ? "causal" : "non-causal";
-      title.textContent = `${trial.subject} trial ${trial.epoch_index + 1} | BOSS ${trial.boss_class} | ${label} ${methodClass(trial, method)} | ${methodPhase(trial, method)?.toFixed(1)} deg`;
+      title.textContent = `${epoch.subject} epoch ${epoch.epoch_index + 1} | BOSS ${epoch.boss_class} | ${label} ${methodClass(epoch, method)} | ${methodPhase(epoch, method)?.toFixed(1)} deg`;
       node.appendChild(title);
       svg.appendChild(node);
     }
 
     function renderPhase() {
       const subject = currentSubject();
-      const trials = currentTrials();
-      const selected = ensureSelectedTrial();
+      const epochs = currentEpochs();
+      const selected = ensureSelectedEpoch();
       const visibleMethods = phaseModeMethods();
       phaseSvg.replaceChildren();
       document.getElementById("phaseTitle").textContent = `${subject?.id || "Subject"} phase circle`;
       const modeText = visibleMethods.map(methodLabel).join(" + ");
-      document.getElementById("phaseSubtitle").textContent = `${trials.length} trials, ${modeText}, +/-${state.tolerance} deg window`;
-      if (!trials.length) {
-        phaseSvg.appendChild(el("text", { x: 410, y: 310, class: "empty" }, "No trials in this cache"));
+      document.getElementById("phaseSubtitle").textContent = `${epochs.length} epochs, ${modeText}, +/-${state.tolerance} deg window`;
+      if (!epochs.length) {
+        phaseSvg.appendChild(el("text", { x: 410, y: 310, class: "empty" }, "No epochs in this cache"));
         return;
       }
 
@@ -1205,14 +1226,14 @@ HTML_TEMPLATE = r"""<!doctype html>
       const minR = 42;
       const maxR = 248;
       const groups = new Map(classOrder.map(name => [name, []]));
-      trials.forEach(trial => {
-        if (!groups.has(trial.boss_class)) groups.set(trial.boss_class, []);
-        groups.get(trial.boss_class).push(trial);
+      epochs.forEach(epoch => {
+        if (!groups.has(epoch.boss_class)) groups.set(epoch.boss_class, []);
+        groups.get(epoch.boss_class).push(epoch);
       });
       const rank = new Map();
-      groups.forEach(group => group.forEach((trial, index) => rank.set(trial.trial_id, { index, n: group.length })));
-      const radiusFor = trial => {
-        const item = rank.get(trial.trial_id) || { index: 0, n: 1 };
+      groups.forEach(group => group.forEach((epoch, index) => rank.set(epoch.epoch_id, { index, n: group.length })));
+      const radiusFor = epoch => {
+        const item = rank.get(epoch.epoch_id) || { index: 0, n: 1 };
         if (item.n <= 1) return (minR + maxR) / 2;
         return minR + (item.index / (item.n - 1)) * (maxR - minR);
       };
@@ -1231,24 +1252,24 @@ HTML_TEMPLATE = r"""<!doctype html>
       });
 
       if (visibleMethods.length === 2) {
-        trials.forEach(trial => {
-          if (!hasCausal(trial)) return;
-          const d = circularConnectorPath(cx, cy, radiusFor(trial), trial.phase_deg, trial.causal_phase_deg);
+        epochs.forEach(epoch => {
+          if (!hasCausal(epoch)) return;
+          const d = circularConnectorPath(cx, cy, radiusFor(epoch), epoch.phase_deg, epoch.causal_phase_deg);
           if (d) {
             phaseSvg.appendChild(el("path", { d, fill: "none", stroke: "#7c8279", "stroke-width": "1", opacity: "0.34" }));
           }
         });
       }
 
-      trials.forEach(trial => {
-        const radius = radiusFor(trial);
+      epochs.forEach(epoch => {
+        const radius = radiusFor(epoch);
         if (visibleMethods.includes("noncausal")) {
-          const [x, y] = polarPoint(cx, cy, radius, trial.phase_deg);
-          addPoint(phaseSvg, trial, "noncausal", x, y);
+          const [x, y] = polarPoint(cx, cy, radius, epoch.phase_deg);
+          addPoint(phaseSvg, epoch, "noncausal", x, y);
         }
-        if (visibleMethods.includes("causal") && hasCausal(trial)) {
-          const [x, y] = polarPoint(cx, cy, radius, trial.causal_phase_deg);
-          addPoint(phaseSvg, trial, "causal", x, y);
+        if (visibleMethods.includes("causal") && hasCausal(epoch)) {
+          const [x, y] = polarPoint(cx, cy, radius, epoch.causal_phase_deg);
+          addPoint(phaseSvg, epoch, "causal", x, y);
         }
       });
 
@@ -1256,18 +1277,18 @@ HTML_TEMPLATE = r"""<!doctype html>
       drawPhaseLegend(phaseSvg, visibleMethods);
     }
 
-    function drawSelectedPair(svg, trial, cx, cy, radius) {
-      const [nonX, nonY] = polarPoint(cx, cy, radius, trial.phase_deg);
-      if (hasCausal(trial)) {
-        const [causalX, causalY] = polarPoint(cx, cy, radius, trial.causal_phase_deg);
-        const d = circularConnectorPath(cx, cy, radius, trial.phase_deg, trial.causal_phase_deg);
+    function drawSelectedPair(svg, epoch, cx, cy, radius) {
+      const [nonX, nonY] = polarPoint(cx, cy, radius, epoch.phase_deg);
+      if (hasCausal(epoch)) {
+        const [causalX, causalY] = polarPoint(cx, cy, radius, epoch.causal_phase_deg);
+        const d = circularConnectorPath(cx, cy, radius, epoch.phase_deg, epoch.causal_phase_deg);
         if (d) {
           svg.appendChild(el("path", { d, fill: "none", stroke: ACCENT, "stroke-width": "2", opacity: "0.72" }));
         }
-        addPoint(svg, trial, "causal", causalX, causalY);
+        addPoint(svg, epoch, "causal", causalX, causalY);
         svg.appendChild(el("circle", { cx: causalX, cy: causalY, r: "13", class: "selected-ring" }));
       }
-      addPoint(svg, trial, "noncausal", nonX, nonY);
+      addPoint(svg, epoch, "noncausal", nonX, nonY);
       svg.appendChild(el("circle", { cx: nonX, cy: nonY, r: "13", class: "selected-ring" }));
     }
 
@@ -1324,19 +1345,19 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
 
     function renderSignal() {
-      const trials = currentTrials();
-      const trial = ensureSelectedTrial() || trials[0];
+      const epochs = currentEpochs();
+      const epoch = ensureSelectedEpoch() || epochs[0];
       signalSvg.replaceChildren();
-      if (!trial) {
-        signalSvg.appendChild(el("text", { x: 540, y: 190, class: "empty" }, "No selected trial"));
+      if (!epoch) {
+        signalSvg.appendChild(el("text", { x: 540, y: 190, class: "empty" }, "No selected epoch"));
         return;
       }
-      state.selectedTrialId = trial.trial_id;
+      state.selectedEpochId = epoch.epoch_id;
 
-      document.getElementById("signalTitle").textContent = `${trial.subject} trial ${trial.epoch_index + 1}`;
-      let meta = `BOSS ${trial.boss_class}; non-causal ${methodClass(trial, "noncausal")}, ${trial.phase_deg?.toFixed(1)} deg`;
-      if (hasCausal(trial)) {
-        meta += `; causal ${methodClass(trial, "causal")}, ${trial.causal_phase_deg.toFixed(1)} deg`;
+      document.getElementById("signalTitle").textContent = `${epoch.subject} epoch ${epoch.epoch_index + 1}`;
+      let meta = `BOSS ${epoch.boss_class}; non-causal ${methodClass(epoch, "noncausal")}, ${epoch.phase_deg?.toFixed(1)} deg`;
+      if (hasCausal(epoch)) {
+        meta += `; causal ${methodClass(epoch, "causal")}, ${epoch.causal_phase_deg.toFixed(1)} deg`;
       }
       document.getElementById("signalMeta").textContent = meta;
 
@@ -1345,17 +1366,17 @@ HTML_TEMPLATE = r"""<!doctype html>
       const height = 380;
       const innerW = width - margin.left - margin.right;
       const innerH = height - margin.top - margin.bottom;
-      const t = trial.signal.t;
+      const t = epoch.signal.t;
       const channelLabel = report.settings.raw_trace_label || `${report.settings.channel || "channel"} raw`;
       const series = [
-        { name: channelLabel, t, y: trial.signal.raw, color: methodColors.raw, width: 1.05, opacity: 0.9 },
-        { name: "non-causal filtered", t, y: trial.signal.filtered, color: methodColors.noncausal, width: 1.8, opacity: 0.95 }
+        { name: channelLabel, t, y: epoch.signal.raw, color: methodColors.raw, width: 1.05, opacity: 0.9 },
+        { name: "non-causal filtered", t, y: epoch.signal.filtered, color: methodColors.noncausal, width: 1.8, opacity: 0.95 }
       ];
-      if (trial.causal_core) {
-        series.push({ name: "causal AR core", t: trial.causal_core.t, y: trial.causal_core.y, color: methodColors.causal, width: 1.55, opacity: 0.95 });
+      if (epoch.causal_core) {
+        series.push({ name: "causal AR core", t: epoch.causal_core.t, y: epoch.causal_core.y, color: methodColors.causal, width: 1.55, opacity: 0.95 });
       }
-      if (trial.causal_future) {
-        series.push({ name: "causal AR prediction", t: trial.causal_future.t, y: trial.causal_future.y, color: methodColors.causal, width: 1.65, opacity: 0.9, dash: "5 5" });
+      if (epoch.causal_future) {
+        series.push({ name: "causal AR prediction", t: epoch.causal_future.t, y: epoch.causal_future.y, color: methodColors.causal, width: 1.65, opacity: 0.9, dash: "5 5" });
       }
       const xMin = Math.min(...series.flatMap(s => s.t));
       const xMax = Math.max(...series.flatMap(s => s.t));
@@ -1374,9 +1395,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       const yScale = value => margin.top + (1 - ((value - yMin) / (yMax - yMin))) * innerH;
 
       signalSvg.appendChild(el("rect", { x: 0, y: 0, width, height, fill: "#ffffff" }));
-      if (trial.causal_future?.t?.length) {
-        const x1 = xScale(Math.min(...trial.causal_future.t));
-        const x2 = xScale(Math.max(...trial.causal_future.t));
+      if (epoch.causal_future?.t?.length) {
+        const x1 = xScale(Math.min(...epoch.causal_future.t));
+        const x2 = xScale(Math.max(...epoch.causal_future.t));
         signalSvg.appendChild(el("rect", { x: x1, y: margin.top, width: Math.max(1, x2 - x1), height: innerH, fill: methodColors.causal, opacity: "0.09" }));
         signalSvg.appendChild(el("text", { x: x1 + 8, y: height - margin.bottom - 8, class: "legend-text" }, "AR prediction"));
       }
@@ -1519,11 +1540,11 @@ HTML_TEMPLATE = r"""<!doctype html>
         ly += 20;
       });
       deviationSvg.appendChild(el("text", { x: 16, y: ly, class: "legend-text" }, "arrows = class mean vectors"));
-      deviationSvg.appendChild(el("text", { x: width - 16, y: 24, class: "legend-text", "text-anchor": "end" }, "rings = trials"));
+      deviationSvg.appendChild(el("text", { x: width - 16, y: 24, class: "legend-text", "text-anchor": "end" }, "rings = epochs"));
 
       const columns = [["All", stats], ...arrowClasses.map(name => [name, histogram.stats_by_class[name]])];
       const rows = [
-        ["Trials (n)", st => String(st.n)],
+        ["Epochs (n)", st => String(st.n)],
         ["Circular mean (bias)", st => `${fmt(st.mean_deg, 1, true)}°`],
         ["Resultant length R", st => fmt(st.R, 3)],
         ["Circular SD", st => `${fmt(st.sd_deg, 1)}°`],
@@ -1548,7 +1569,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       const highlight = subjects.includes(state.highlightSubject) ? state.highlightSubject : null;
       highlightSelect.value = highlight || "";
       document.getElementById("successSubtitle").textContent =
-        `Non-causal phase within ±T of the BOSS target, % of BOSS-labeled trials per subject (unclassified = failure). n = ${subjects.length} subjects; bar = mean, whiskers = ±1 SD; dashed = chance (2T/360).`;
+        `Non-causal phase within ±T of the BOSS target, % of BOSS-labeled epochs per subject (unclassified = failure). n = ${subjects.length} subjects; bar = mean, whiskers = ±1 SD; dashed = chance (2T/360).`;
       successSvg.replaceChildren();
 
       const margin = { left: 64, right: 24, top: 24, bottom: 58 };
@@ -1695,7 +1716,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       subjectSelect.value = state.subjectId;
       subjectSelect.addEventListener("change", event => {
         state.subjectId = event.target.value;
-        state.selectedTrialId = null;
+        state.selectedEpochId = null;
         renderAll();
       });
 
@@ -1731,16 +1752,16 @@ HTML_TEMPLATE = r"""<!doctype html>
       successSvg.addEventListener("click", highlightFromEvent);
       document.getElementById("successTable").addEventListener("click", highlightFromEvent);
 
-      const selectTrial = event => {
-        const target = event.target.closest("[data-trial-id]");
+      const selectEpoch = event => {
+        const target = event.target.closest("[data-epoch-id]");
         if (!target) return;
         event.preventDefault();
-        state.selectedTrialId = target.getAttribute("data-trial-id");
+        state.selectedEpochId = target.getAttribute("data-epoch-id");
         renderAll();
       };
-      phaseSvg.addEventListener("click", selectTrial);
+      phaseSvg.addEventListener("click", selectEpoch);
       phaseSvg.addEventListener("keydown", event => {
-        if (event.key === "Enter" || event.key === " ") selectTrial(event);
+        if (event.key === "Enter" || event.key === " ") selectEpoch(event);
       });
     }
 
@@ -1758,9 +1779,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     function renderRunMeta() {
       const generated = report.generated_at ? `Generated ${report.generated_at}` : "Generated from cached results";
       const subjectCount = report.subjects.length;
-      const trialCount = report.total_trials || report.subjects.reduce((sum, subject) => sum + subject.n_trials, 0);
+      const epochCount = report.total_epochs || report.subjects.reduce((sum, subject) => sum + subject.n_epochs, 0);
       const band = report.settings.band_hz || [];
-      document.getElementById("runMeta").textContent = `${generated}. ${subjectCount} subject(s), ${trialCount} trial(s), ${report.settings.channel} signal, ${band.join("-")} Hz, cutoff ${report.settings.cutoff_ms} ms.`;
+      document.getElementById("runMeta").textContent = `${generated}. ${subjectCount} subject(s), ${epochCount} epoch(s), ${report.settings.channel} signal, ${band.join("-")} Hz, cutoff ${report.settings.cutoff_ms} ms.`;
     }
 
     function renderAll() {

@@ -8,7 +8,7 @@ real-time phase decision: epochs.metadata only carries a categorical "Condition"
 not a continuous phase value. So there is no offline ground-truth phase to compare
 against here -- instead this checks whether phastimate()'s own causal AR estimate,
 computed independently from the same pre-pulse data, at CUTOFF_MS agrees with what the
-device decided online. "random" trials have no target and are excluded from the
+device decided online. "random" epochs have no target and are excluded from the
 phase-error/accuracy stats (shown separately for reference).
 
 Edit the CAPS parameters below, then run:  python causal_vs_boss.py
@@ -62,10 +62,10 @@ WINDOW_MS = 510.0               # length of the window feeding the AR predictor
 
 # ---- causal-vs-device: AR-forecasted phase at the pulse, vs. device's targeted class ----
 CUTOFF_MS = 0.0                  # split point: AR core before, AR-predicted after (t=0 = pulse)
-N_TRIALS = False                 # limit to the first N trials; False = use all
+N_EPOCHS = False                 # limit to the first N epochs; False = use all
 
 # Real EEG in the ~50ms right before the pulse is contaminated (coil-related artifact --
-# confirmed empirically: raw-signal correlation across trials in that window is ~0.98-1.0,
+# confirmed empirically: raw-signal correlation across epochs in that window is ~0.98-1.0,
 # vs ~0 hundreds of ms earlier). phastimate()'s own EDGE trimming already keeps the last
 # EDGE samples out of the AR-fit core (they're filter-edge artifact, not real data used for
 # fitting), but that's separate from this recording artifact -- ARTIFACT_MARGIN_MS pushes
@@ -110,7 +110,7 @@ def load(subject):
     # exp epochs carry a genuine TMS discharge right after t=0 (post-pulse amplitude is
     # ~4000x pre-pulse here) -- resample()'s anti-aliasing filter runs over the whole
     # epoch and its ringing smears that huge spike backward through the pre-pulse window
-    # (empirically: cross-trial correlation in the "clean" pre-pulse data jumps from ~0 to
+    # (empirically: cross-epoch correlation in the "clean" pre-pulse data jumps from ~0 to
     # ~0.98-1.0 after a naive resample). We only ever use pre-pulse data (CUTOFF_MS=0 is
     # the latest point used), so cropping the post-pulse artifact out *before* resampling
     # keeps the filter from ever seeing it. Matches the source preprocessing scripts'
@@ -160,8 +160,8 @@ def _predicted_class(phase_deg):
     return "positive" if abs(_phase_diff_deg(phase_deg, 0.0)) < 90 else "negative"
 
 
-def _plot_trial(i, n, x, times_ms, est, condition):
-    """Per-trial signal overlay: raw / causal (AR-forecast), device's declared condition."""
+def _plot_epoch(i, n, x, times_ms, est, condition):
+    """Per-epoch signal overlay: raw / causal (AR-forecast), device's declared condition."""
     fig, ax = plt.subplots(figsize=(9, 4))
     ax.plot(times_ms, x, color="black", lw=1, label=f"raw ({CHANNEL})")
     ax.plot(est["core_times_ms"], est["core"], color="tab:red", lw=1.2, label="AR core (causal, filtered)")
@@ -174,27 +174,27 @@ def _plot_trial(i, n, x, times_ms, est, condition):
     ax.plot([], [], " ", label=f"causal phase @ t=0: {causal_phase_deg:.1f}°")
     ax.plot([], [], " ", label=f"device condition: {condition}")
     ax.plot([], [], " ", label=f"causal-implied class: {predicted} ({'match' if predicted == condition else 'mismatch'})")
-    ax.set_title(f"Trial {i + 1}/{n}  |  device={condition}, causal phase={causal_phase_deg:.1f}°")
+    ax.set_title(f"Epoch {i + 1}/{n}  |  device={condition}, causal phase={causal_phase_deg:.1f}°")
     ax.set_xlabel("Time (ms)")
     ax.legend(loc="upper left", fontsize=8)
     fig.tight_layout()
 
     if SAVE:
-        Path("trial_plots").mkdir(exist_ok=True)
-        fig.savefig(f"trial_plots/boss_trial_{i + 1:03d}.png", dpi=150)
+        Path("epoch_plots").mkdir(exist_ok=True)
+        fig.savefig(f"epoch_plots/boss_epoch_{i + 1:03d}.png", dpi=150)
     return fig
 
 
 def _causal_vs_boss_one(subject, fs, data, times_ms, conditions):
-    """Compute the causal AR phase at CUTOFF_MS per trial and compare to the device's
-    declared condition. Returns (phase_deg, conditions, trials) aligned arrays, where
-    `trials` holds per-point data needed for click-through (trial_index, x, est, condition, n)."""
+    """Compute the causal AR phase at CUTOFF_MS per epoch and compare to the device's
+    declared condition. Returns (phase_deg, conditions, epoch_points) aligned arrays, where
+    `epoch_points` holds per-point data needed for click-through (epoch_index, x, est, condition, n)."""
     b = design_bandpass(FILTER_ORDER, BAND[0], BAND[1], fs)
-    n = N_TRIALS or len(data)
+    n = N_EPOCHS or len(data)
     cutoff = int(np.argmin(np.abs(times_ms - CUTOFF_MS)))
     win = round(WINDOW_MS / 1000 * fs)
 
-    trials = []
+    epoch_points = []
     phase_deg, conds = [], []
     for i, (x, condition) in enumerate(zip(data[:n], conditions[:n])):
         est = _causal_estimate(x, times_ms, fs, b, cutoff, win)
@@ -202,7 +202,7 @@ def _causal_vs_boss_one(subject, fs, data, times_ms, conditions):
             continue
         phase_deg.append(to_0_360(est["phase"]))
         conds.append(condition)
-        trials.append((i, x, est, condition, n))
+        epoch_points.append((i, x, est, condition, n))
 
     phase_deg = np.array(phase_deg)
     conds = np.array(conds)
@@ -214,7 +214,7 @@ def _causal_vs_boss_one(subject, fs, data, times_ms, conditions):
         predicted = np.array([_predicted_class(p) for p in phase_deg[targeted]])
         matches = predicted == conds[targeted]
         print(
-            f"[{subject}] causal vs device @ t=0 (n={targeted.sum()}/{len(conds)} targeted trials, "
+            f"[{subject}] causal vs device @ t=0 (n={targeted.sum()}/{len(conds)} targeted epochs, "
             f"{(~targeted).sum()} random excluded): "
             f"|phase error| {np.mean(np.abs(errors_deg)):.1f}° ± {np.std(np.abs(errors_deg)):.1f}°, "
             f"class agreement {100 * matches.mean():.1f}%"
@@ -227,9 +227,9 @@ def _causal_vs_boss_one(subject, fs, data, times_ms, conditions):
                     f"± {np.std(np.abs(errors_deg[sel])):.1f}°, agreement {100 * matches[sel].mean():.1f}%"
                 )
     else:
-        print(f"[{subject}] no positive/negative-targeted trials with a usable causal estimate")
+        print(f"[{subject}] no positive/negative-targeted epochs with a usable causal estimate")
 
-    return phase_deg, conds, trials
+    return phase_deg, conds, epoch_points
 
 
 _CONDITION_COLOR = {"positive": "tab:red", "negative": "tab:blue", "random": "tab:gray"}
@@ -237,18 +237,18 @@ _CONDITION_COLOR = {"positive": "tab:red", "negative": "tab:blue", "random": "ta
 
 def causal_vs_boss(subject_data):
     """subject_data: list of (subject, fs, data, times_ms, conditions). Plots causal
-    phase (deg) per trial, colored by the device's declared condition, one panel per
+    phase (deg) per epoch, colored by the device's declared condition, one panel per
     subject side by side in a single figure."""
     fig, axes = plt.subplots(1, len(subject_data), figsize=(5 * len(subject_data), 5),
                               squeeze=False, subplot_kw=dict(projection="polar"))
     axes = axes[0]
 
     scatters_by_ax = []
-    trials_by_ax = []
+    epoch_points_by_ax = []
     times_ms_by_ax = []
 
     for ax, (subject, fs, data, times_ms, conditions) in zip(axes, subject_data):
-        phase_deg, conds, trials = _causal_vs_boss_one(subject, fs, data, times_ms, conditions)
+        phase_deg, conds, epoch_points = _causal_vs_boss_one(subject, fs, data, times_ms, conditions)
         scatters = []
         for condition, color in _CONDITION_COLOR.items():
             sel = conds == condition
@@ -257,14 +257,14 @@ def causal_vs_boss(subject_data):
             r = np.arange(sel.sum())  # spread points radially so overlapping angles are visible
             scatter = ax.scatter(np.radians(phase_deg[sel]), r, s=20, alpha=0.7, color=color,
                                   label=condition, picker=True, pickradius=6)
-            scatters.append((scatter, [t for t, keep in zip(trials, sel) if keep]))
+            scatters.append((scatter, [t for t, keep in zip(epoch_points, sel) if keep]))
         for target_deg in CONDITION_TARGET_DEG.values():
             ax.axvline(np.radians(target_deg), color="black", ls=":", lw=1, alpha=0.5)
         ax.set_title(subject)
         ax.set_yticklabels([])
         ax.legend(loc="upper right", fontsize=7, bbox_to_anchor=(1.3, 1.1))
         scatters_by_ax.append(scatters)
-        trials_by_ax.append(trials)
+        epoch_points_by_ax.append(epoch_points)
         times_ms_by_ax.append(times_ms)
 
     fig.suptitle("Causal (AR-forecast) phase @ t=0 vs. device-declared condition -- "
@@ -273,10 +273,10 @@ def causal_vs_boss(subject_data):
 
     def on_pick(event):
         for ax_idx, scatters in enumerate(scatters_by_ax):
-            for scatter, sub_trials in scatters:
+            for scatter, sub_epoch_points in scatters:
                 if event.artist is scatter and len(event.ind):
-                    i, x, est, condition, n = sub_trials[event.ind[0]]
-                    _plot_trial(i, n, x, times_ms_by_ax[ax_idx], est, condition).show()
+                    i, x, est, condition, n = sub_epoch_points[event.ind[0]]
+                    _plot_epoch(i, n, x, times_ms_by_ax[ax_idx], est, condition).show()
                     return
 
     fig.canvas.mpl_connect("pick_event", on_pick)

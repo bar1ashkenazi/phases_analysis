@@ -1,7 +1,7 @@
 """Step through TMS-pulse epochs and look at the phase estimation on the C3 trace.
 
-Each trial opens its own window; close it to advance to the next one.
-Edit the toggles below, then run:  python visualize_trials.py
+Each epoch opens its own window; close it to advance to the next one.
+Edit the toggles below, then run:  python visualize_epochs.py
 """
 
 from pathlib import Path
@@ -18,15 +18,15 @@ from run import (
 )
 
 # ---- TOGGLES ------------------------------------------------------------
-SHOW = True                    # open an interactive window per trial (close it to advance)
-SAVE = False                   # also save each trial's plot as a PNG
+SHOW = True                    # open an interactive window per epoch (close it to advance)
+SAVE = False                   # also save each epoch's plot as a PNG
 SHOW_ESTIMATE = False          # overlay the filtered oscillation + the fitted sine wave
 
-OUT_DIR = Path("trial_plots")  # only used when SAVE = True
+OUT_DIR = Path("epoch_plots")  # only used when SAVE = True
 
 
 def main():
-    # This tool steps through trials one window at a time, so it only makes sense for one
+    # This tool steps through epochs one window at a time, so it only makes sense for one
     # subject; if SUBJECT is a list (as in run.py/pipeline.py), the first entry is used.
     subject = SUBJECT if isinstance(SUBJECT, str) else SUBJECT[0]
     epo_path = (
@@ -81,14 +81,14 @@ def main():
         cond = ""
         if epochs.metadata is not None and "Condition" in epochs.metadata.columns:
             cond = f", condition={epochs.metadata.iloc[i]['Condition']}"
-        ax.set_title(f"Trial {i + 1}/{len(data_uv)}{cond}")
+        ax.set_title(f"Epoch {i + 1}/{len(data_uv)}{cond}")
         ax.set_xlabel("Time relative to TMS pulse (ms)")
         ax.set_ylabel("Amplitude (µV)")
         ax.legend(loc="upper left", fontsize=8)
         fig.tight_layout()
 
         if SAVE:
-            fig.savefig(OUT_DIR / f"trial_{i + 1:03d}.png", dpi=150)
+            fig.savefig(OUT_DIR / f"epoch_{i + 1:03d}.png", dpi=150)
         if SHOW:
             plt.show()
         else:

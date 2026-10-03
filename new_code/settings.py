@@ -35,7 +35,7 @@ LABELS = DEFAULT_LABELS  # class names + raw metadata values for positive/negati
 DOWNSAMPLE = True
 DOWNSAMPLE_FS = 1000.0
 LOWPASS_BEFORE_DOWNSAMPLE_HZ = 100.0
-N_TRIALS = False  # False = all epochs; an int caps epochs per subject (fast smoke runs)
+N_EPOCHS = False  # False = all epochs; an int caps epochs per subject (fast smoke runs)
 
 SHOW_METADATA_SUMMARY = True
 METADATA_MAX_VALUES = 12
@@ -95,7 +95,7 @@ MANUAL_CAUSAL_PARAMS = {
 OPT_N_TRIALS = 200
 OPT_TRAIN_FRACTION = 0.8
 OPT_RANDOM_SEED = 0
-OPT_MIN_TRIALS = 20
+OPT_MIN_EPOCHS = 20
 OPT_WINDOW_MS_RANGE = (300, 950)
 OPT_WINDOW_MS_STEP = 10
 OPT_FILTER_ORDER_RANGE = (150, 450)
@@ -108,7 +108,7 @@ CAUSAL_OPTIMIZATION_CONFIG = {
     "n_opt_trials": OPT_N_TRIALS,
     "train_fraction": OPT_TRAIN_FRACTION,
     "random_seed": OPT_RANDOM_SEED,
-    "min_usable_trials": OPT_MIN_TRIALS,
+    "min_usable_epochs": OPT_MIN_EPOCHS,
     "window_ms_range": OPT_WINDOW_MS_RANGE,
     "window_ms_step": OPT_WINDOW_MS_STEP,
     "filter_order_range": OPT_FILTER_ORDER_RANGE,
